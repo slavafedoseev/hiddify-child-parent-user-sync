@@ -1,0 +1,20 @@
+[Unit]
+Description=Run Hiddify Child Panel Sync every 5 minutes
+Documentation=https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+Requires=hiddify-child-sync.service
+
+[Timer]
+# Запуск через 2 минуты после загрузки системы
+OnBootSec=2min
+
+# Запуск каждые 5 минут после последнего завершения сервиса
+OnUnitActiveSec=5min
+
+# Сохранять время последнего запуска при перезагрузке
+Persistent=true
+
+# Добавить случайную задержку до 30 секунд для избежания коллизий
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

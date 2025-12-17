@@ -1,0 +1,27 @@
+[Unit]
+Description=Hiddify Child Panel Synchronization
+Documentation=https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+After=network-online.target mysql.service hiddify-panel.service
+Wants=network-online.target
+ConditionPathExists=/opt/hiddify-manager/current.json
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hiddify-manager
+Environment=HIDDIFY_CONFIG_PATH=/opt/hiddify-manager/
+ExecStart=/opt/hiddify-manager/.venv313/bin/python /opt/hiddify-manager/stable_sync.py
+
+# Логирование в systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiddify-child-sync
+
+# Безопасность
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

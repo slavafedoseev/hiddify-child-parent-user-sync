@@ -1,0 +1,35 @@
+[Unit]
+Description=Hiddify Child Sync Health API
+Documentation=https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+After=network-online.target mysql.service hiddify-panel.service
+Wants=network-online.target
+ConditionPathExists=/opt/hiddify-manager/current.json
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hiddify-manager
+Environment=HIDDIFY_CONFIG_PATH=/opt/hiddify-manager/
+ExecStart=/opt/hiddify-manager/.venv313/bin/python /opt/hiddify-manager/sync_health_api.py
+
+# Автоматический перезапуск при сбоях
+Restart=always
+RestartSec=10
+
+# Ограничения на перезапуск (не более 10 раз за 10 минут)
+StartLimitBurst=10
+StartLimitIntervalSec=600
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiddify-sync-api
+
+# Безопасность
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
