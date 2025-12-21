@@ -231,8 +231,8 @@ def sync_users_from_parent():
                             uuid, name, usage_limit, package_days, mode, enable, 
                             comment, start_date, last_reset_time, current_usage,
                             telegram_id, ed25519_private_key, ed25519_public_key,
-                            wg_pk, wg_psk, wg_pub, added_by
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s)
+                            wg_pk, wg_psk, wg_pub, added_by, last_online, max_ips
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, 100)
                     """, (
                         uuid, parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3),
                         parent_user['package_days'], parent_user['mode'], parent_user['enable'],
@@ -240,7 +240,7 @@ def sync_users_from_parent():
                         parent_user.get('last_reset_time'), parent_user.get('telegram_id'),
                         parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
                         parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''), 
-                        parent_user.get('wg_pub', ''), 1  # Используем admin ID=1
+                        parent_user.get('wg_pub', ''), 1, datetime.now()  # admin ID=1, last_online
                     ))
                     created_count += 1
                     log(f"➕ Создан новый пользователь: {parent_user['name']}")
