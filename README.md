@@ -1,6 +1,6 @@
-# Hiddify Manager - Child→Parent User Synchronization v4.0
+# Hiddify Manager - Child→Parent User Synchronization v5.0
 
-**Надёжная автоматическая синхронизация пользователей и трафика между child и parent панелями Hiddify Manager**
+**Надёжная автоматическая синхронизация пользователей и трафика между child и parent панелями Hiddify Manager с мгновенной активацией новых пользователей**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hiddify Manager](https://img.shields.io/badge/Hiddify-v11.0.12b1+-blue.svg)](https://github.com/hiddify/hiddify-manager)
@@ -75,6 +75,9 @@
 
 - ✅ **Получение** списка всех пользователей с parent панели
 - ✅ **Создание** новых пользователей локально при их появлении на parent
+- ✅ **Мгновенная активация** новых пользователей в работающих Xray inbound'ах (v2.0+)
+- ✅ **Работа без Apply Config** - новые пользователи начинают работать сразу
+- ✅ **proto_map из Hiddify** - корректное определение протоколов (vless, vmess, trojan, shadowsocks)
 - ✅ **Обновление** существующих пользователей (имя, лимиты, ключи, комментарии)
 - ✅ **Блокировка** пользователей, заблокированных на parent
 - ✅ **Разблокировка** пользователей, разблокированных на parent
