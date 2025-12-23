@@ -1,29 +1,16 @@
 #!/opt/hiddify-manager/.venv313/bin/python
 # -*- coding: utf-8 -*-
 """
-Activate New Users in Xray Direct API v2.0 (FIXED with proto_map)
+Activate New Users in Xray Direct API v3.0 (FIXED: Trojan без flow)
 Прямая активация новых пользователей в работающих Xray inbound'ах
 
-НАЗНАЧЕНИЕ:
-- Активирует новосозданных пользователей в Xray без Apply Config
-- Подключается напрямую к Xray API через xtlsapi
-- Работает без Flask app context (standalone скрипт)
-
-ИСПОЛЬЗОВАНИЕ:
-    sudo /opt/hiddify-manager/activate_new_users_direct.py <UUID1> [UUID2] [UUID3] ...
-
-АВТОР: Auto-activation system for Hiddify Manager
-ВЕРСИЯ: 2.0 (CRITICAL FIX: proto_map для правильного определения протоколов)
+ВЕРСИЯ: 3.0 (CRITICAL FIX: Trojan НЕ поддерживает flow parameter)
 """
 
 import sys
 import pymysql
 import xtlsapi
 import traceback
-
-# ============================================================================
-# КОНФИГУРАЦИЯ
-# ============================================================================
 
 # Конфигурация подключения к MySQL
 DB_CONFIG = {
@@ -38,10 +25,6 @@ DB_CONFIG = {
 # Xray API адрес
 XRAY_API_HOST = '127.0.0.1'
 XRAY_API_PORT = 10085
-
-# ============================================================================
-# ФУНКЦИИ
-# ============================================================================
 
 def log(message):
     """Вывод лога с префиксом"""
@@ -58,15 +41,7 @@ def get_db_connection():
         return None
 
 def get_user_info(uuid):
-    """
-    Получить информацию о пользователе из БД
-
-    Args:
-        uuid: UUID пользователя
-
-    Returns:
-        dict: {'name': str, 'enable': int, 'uuid': str} или None
-    """
+    """Получить информацию о пользователе из БД"""
     conn = get_db_connection()
     if not conn:
         return None
@@ -86,19 +61,13 @@ def get_user_info(uuid):
         return None
 
 def get_xray_inbound_tags():
-    """
-    Получить список всех inbound tags из Xray
-
-    Returns:
-        list: Список тегов (строки)
-    """
+    """Получить список всех inbound tags из Xray"""
     try:
         xray_client = xtlsapi.XrayClient(XRAY_API_HOST, XRAY_API_PORT)
         inbounds = xray_client.stats_query('inbound')
 
         tags = []
         for inb in inbounds:
-            # Name формата: "inbound>>>tag_name"
             if ">>>" in inb.name:
                 tag = inb.name.split(">>>")[1]
                 tags.append(tag)
@@ -110,16 +79,8 @@ def get_xray_inbound_tags():
         return []
 
 def determine_protocol_and_flow(tag):
-    """
-    Определить protocol и flow для тега (FIXED: proto_map как в Hiddify)
-
-    Args:
-        tag: Строка с именем тега
-
-    Returns:
-        tuple: (protocol, flow)
-    """
-    # Карта определения протокола по ключевым словам - из Hiddify xray_api.py
+    """Определить protocol и flow для тега"""
+    # Карта определения протокола - из Hiddify xray_api.py
     proto_map = {
         'vless': 'vless',
         'realityin': 'vless',
@@ -134,7 +95,6 @@ def determine_protocol_and_flow(tag):
         'v2ray': 'shadowsocks',
     }
     
-    # Определяем протокол по первому совпадению
     protocol = None
     tag_lower = tag.lower()
     for keyword, proto in proto_map.items():
@@ -143,32 +103,21 @@ def determine_protocol_and_flow(tag):
             break
     
     if not protocol:
-        # Если не опознан - по умолчанию vless (как в оригинале)
         protocol = 'vless'
     
-    # flow='xtls-rprx-vision' только для realityin_tcp, для остальных - null byte (как в Hiddify)
+    # flow='xtls-rprx-vision' только для realityin_tcp
     flow = 'xtls-rprx-vision' if 'realityin_tcp' in tag_lower else '\0'
     
     return (protocol, flow)
 
 def activate_user_in_xray(uuid, user_name):
-    """
-    Активировать пользователя во всех доступных Xray inbound'ах
-
-    Args:
-        uuid: UUID пользователя
-        user_name: Имя пользователя (для логов)
-
-    Returns:
-        int: Количество успешно активированных inbound'ов
-    """
+    """Активировать пользователя во всех доступных Xray inbound'ах"""
     try:
         xray_client = xtlsapi.XrayClient(XRAY_API_HOST, XRAY_API_PORT)
     except Exception as e:
         log(f"❌ Не удалось подключиться к Xray API: {e}")
         return 0
 
-    # Получаем список inbound tags
     tags = get_xray_inbound_tags()
     if not tags:
         log(f"⚠️ Не найдено inbound tags в Xray")
@@ -183,48 +132,44 @@ def activate_user_in_xray(uuid, user_name):
         protocol, flow = determine_protocol_and_flow(tag)
 
         try:
-            # Добавляем клиента в inbound
-            xray_client.add_client(
-                tag,  # позиционный аргумент
-                uuid,
-                email,
-                protocol=protocol,
-                flow=flow,
-                alter_id=0,
-                cipher='chacha20_poly1305'
-            )
+            # КРИТИЧНО: Trojan НЕ поддерживает параметр flow!
+            if protocol == 'trojan':
+                xray_client.add_client(
+                    tag,
+                    uuid,
+                    email,
+                    protocol=protocol,
+                    alter_id=0,
+                    cipher='chacha20_poly1305'
+                )
+            else:
+                xray_client.add_client(
+                    tag,
+                    uuid,
+                    email,
+                    protocol=protocol,
+                    flow=flow,
+                    alter_id=0,
+                    cipher='chacha20_poly1305'
+                )
             log(f"  ✓ Добавлен в {tag} ({protocol})")
             activated_count += 1
 
         except xtlsapi.xtlsapi.exceptions.EmailAlreadyExists:
-            # UUID уже существует в этом inbound - это нормально
             log(f"  ✓ Уже существует в {tag} ({protocol})")
-            log(f"  ✓ Добавлен в {tag} ({protocol})")
             activated_count += 1
-            pass
 
         except Exception as e:
-            # Игнорируем ошибки для невалидных тегов
             log(f"  ✗ Ошибка {tag}: {e}")
-            pass
 
     return activated_count
 
 def activate_users(uuids):
-    """
-    Активировать список пользователей
-
-    Args:
-        uuids: Список UUID пользователей
-
-    Returns:
-        tuple: (успешно_активировано, всего_пользователей)
-    """
+    """Активировать список пользователей"""
     log(f"🔧 Активация {len(uuids)} новых пользователей в Xray...")
 
     success_count = 0
     for uuid in uuids:
-        # Получаем информацию о пользователе
         user = get_user_info(uuid)
 
         if not user:
@@ -235,7 +180,6 @@ def activate_users(uuids):
             log(f"⚠️ Пользователь {user['name']} ({uuid}) отключен (enable=0)")
             continue
 
-        # Активируем пользователя
         activated_count = activate_user_in_xray(uuid, user['name'])
 
         if activated_count > 0:
@@ -246,17 +190,12 @@ def activate_users(uuids):
 
     return success_count, len(uuids)
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
 def main():
     """Главная функция"""
     if len(sys.argv) < 2:
         log("❌ Использование: activate_new_users_direct.py <UUID1> [UUID2] ...")
         return 1
 
-    # Получаем UUID из аргументов командной строки
     uuids = sys.argv[1:]
 
     try:

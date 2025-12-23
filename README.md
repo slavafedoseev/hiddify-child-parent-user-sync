@@ -597,3 +597,19 @@ hiddify-child-parent-user-sync/
 **Made with ❤️ for Hiddify Community**
 
 *Последнее обновление: 17 декабря 2025*
+
+## ⚠️ КРИТИЧНОЕ ПРЕДУПРЕЖДЕНИЕ
+
+**НЕ ГЕНЕРИРУЙТЕ username/password при создании пользователей!**
+
+Hiddify использует UUID-авторизацию для подписок. Если установить `password != ""`, механизм авторизации по UUID сломается и подписки перестанут работать (редирект на логин вместо конфигов).
+
+**Правильно**: `password = ""` (пустая строка или NULL)  
+**Неправильно**: Генерация случайного password при создании пользователя
+
+См. `/opt/hiddify-manager/.venv313/lib/python3.13/site-packages/hiddifypanel/auth.py:168`:
+```python
+if not account or account.password!="":  # Если password не пустой - logout!
+    return logout_redirect()
+```
+
