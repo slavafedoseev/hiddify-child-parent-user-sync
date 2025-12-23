@@ -1,4 +1,4 @@
-# Hiddify Manager - Child→Parent User Synchronization v5.0
+# Hiddify Manager - Child→Parent User Synchronization v2.0
 
 **Надёжная автоматическая синхронизация пользователей и трафика между child и parent панелями Hiddify Manager с мгновенной активацией новых пользователей**
 
@@ -113,6 +113,7 @@
 | Компонент | Описание | Порт/Путь |
 |-----------|----------|-----------|
 | **stable_sync.py** | Основной скрипт синхронизации | - |
+| **activate_new_users_direct.py** | Мгновенная активация новых пользователей в Xray | - |
 | **sync_health_api.py** | HTTP API для мониторинга | `localhost:8081` |
 | **hiddify-child-sync.timer** | Systemd таймер (каждые 5 мин) | - |
 | **hiddify-child-sync.service** | Systemd сервис синхронизации | - |
@@ -158,6 +159,17 @@
 │    - Если не существует → CREATE                           │
 │    - Если существует → UPDATE (все поля кроме трафика)     │
 │  • Блокировка отсутствующих на parent                      │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 4.5: Мгновенная активация новых пользователей ✨     │
+│  • Вызывается activate_new_users_direct.py                 │
+│  • Подключается к Xray API (127.0.0.1:10085)              │
+│  • Определяет все работающие inbound tags                  │
+│  • Добавляет новых пользователей в каждый inbound          │
+│  • Использует proto_map для правильных протоколов          │
+│  • РЕЗУЛЬТАТ: VPN работает сразу, без Apply Config!       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -181,8 +193,10 @@ cd hiddify-child-parent-user-sync
 
 # 2. Скопируйте файлы
 sudo cp src/stable_sync.py /opt/hiddify-manager/
+sudo cp src/activate_new_users_direct.py /opt/hiddify-manager/
 sudo cp src/sync_health_api.py /opt/hiddify-manager/
 sudo chmod +x /opt/hiddify-manager/stable_sync.py
+sudo chmod +x /opt/hiddify-manager/activate_new_users_direct.py
 sudo chmod +x /opt/hiddify-manager/sync_health_api.py
 
 # 3. Установите systemd сервисы

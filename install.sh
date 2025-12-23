@@ -191,6 +191,9 @@ download_files() {
     log_info "Загрузка sync_health_api.py..."
     curl -fsSL "${RAW_URL}/src/sync_health_api.py" -o "$temp_dir/sync_health_api.py"
 
+    log_info "Загрузка activate_new_users_direct.py..."
+    curl -fsSL "${RAW_URL}/src/activate_new_users_direct.py" -o "$temp_dir/activate_new_users_direct.py"
+
     log_info "Загрузка systemd файлов..."
     curl -fsSL "${RAW_URL}/systemd/hiddify-child-sync.service" -o "$temp_dir/hiddify-child-sync.service"
     curl -fsSL "${RAW_URL}/systemd/hiddify-child-sync.timer" -o "$temp_dir/hiddify-child-sync.timer"
@@ -215,9 +218,14 @@ install_scripts() {
     cp "$temp_dir/sync_health_api.py" /opt/hiddify-manager/
     chmod +x /opt/hiddify-manager/sync_health_api.py
 
+    log_info "Копирование activate_new_users_direct.py..."
+    cp "$temp_dir/activate_new_users_direct.py" /opt/hiddify-manager/
+    chmod +x /opt/hiddify-manager/activate_new_users_direct.py
+
     # Устанавливаем права
     chown root:hiddify-common /opt/hiddify-manager/stable_sync.py
     chown root:hiddify-common /opt/hiddify-manager/sync_health_api.py
+    chown root:hiddify-common /opt/hiddify-manager/activate_new_users_direct.py
 
     log_success "Скрипты установлены"
 }
@@ -293,6 +301,7 @@ verify_installation() {
     log_info "Проверка файлов..."
     for file in "/opt/hiddify-manager/stable_sync.py" \
                 "/opt/hiddify-manager/sync_health_api.py" \
+                "/opt/hiddify-manager/activate_new_users_direct.py" \
                 "/etc/systemd/system/hiddify-child-sync.service" \
                 "/etc/systemd/system/hiddify-child-sync.timer" \
                 "/etc/systemd/system/hiddify-sync-api.service"; do
