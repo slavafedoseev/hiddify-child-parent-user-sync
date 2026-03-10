@@ -23,7 +23,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Версия скрипта
-VERSION="4.0"
+VERSION="5.0"
 
 # GitHub репозиторий
 GITHUB_REPO="slavafedoseev/hiddify-child-parent-user-sync"
@@ -199,6 +199,12 @@ download_files() {
     curl -fsSL "${RAW_URL}/systemd/hiddify-child-sync.timer" -o "$temp_dir/hiddify-child-sync.timer"
     curl -fsSL "${RAW_URL}/systemd/hiddify-sync-api.service" -o "$temp_dir/hiddify-sync-api.service"
 
+    log_info "Загрузка hiddify-patch-celery-rollback.py..."
+    curl -fsSL "${RAW_URL}/src/hiddify-patch-celery-rollback.py" -o "$temp_dir/hiddify-patch-celery-rollback.py"
+
+    log_info "Загрузка celery-rollback-patch.conf..."
+    curl -fsSL "${RAW_URL}/systemd/celery-rollback-patch.conf" -o "$temp_dir/celery-rollback-patch.conf"
+
     log_success "Все файлы загружены"
 
     echo "$temp_dir"
@@ -221,6 +227,10 @@ install_scripts() {
     log_info "Копирование activate_new_users_direct.py..."
     cp "$temp_dir/activate_new_users_direct.py" /opt/hiddify-manager/
     chmod +x /opt/hiddify-manager/activate_new_users_direct.py
+
+    log_info "Копирование hiddify-patch-celery-rollback.py..."
+    cp "$temp_dir/hiddify-patch-celery-rollback.py" /usr/local/bin/
+    chmod +x /usr/local/bin/hiddify-patch-celery-rollback.py
 
     # Устанавливаем права
     chown root:hiddify-common /opt/hiddify-manager/stable_sync.py
@@ -252,8 +262,18 @@ install_systemd_services() {
     cp "$temp_dir/hiddify-child-sync.timer" /etc/systemd/system/
     cp "$temp_dir/hiddify-sync-api.service" /etc/systemd/system/
 
+    # Устанавливаем drop-in для автопатча Celery (переживает обновления Hiddify)
+    log_info "Установка Celery rollback patch drop-in..."
+    mkdir -p /etc/systemd/system/hiddify-panel-background-tasks.service.d
+    cp "$temp_dir/celery-rollback-patch.conf" /etc/systemd/system/hiddify-panel-background-tasks.service.d/
+
     log_info "Перезагрузка systemd daemon..."
     systemctl daemon-reload
+
+    # Применяем патч и перезапускаем background tasks
+    log_info "Применение Celery stability patch..."
+    /usr/bin/python3 /usr/local/bin/hiddify-patch-celery-rollback.py || true
+    systemctl restart hiddify-panel-background-tasks.service 2>/dev/null || true
 
     log_success "Systemd сервисы установлены"
 }
@@ -302,9 +322,11 @@ verify_installation() {
     for file in "/opt/hiddify-manager/stable_sync.py" \
                 "/opt/hiddify-manager/sync_health_api.py" \
                 "/opt/hiddify-manager/activate_new_users_direct.py" \
+                "/usr/local/bin/hiddify-patch-celery-rollback.py" \
                 "/etc/systemd/system/hiddify-child-sync.service" \
                 "/etc/systemd/system/hiddify-child-sync.timer" \
-                "/etc/systemd/system/hiddify-sync-api.service"; do
+                "/etc/systemd/system/hiddify-sync-api.service" \
+                "/etc/systemd/system/hiddify-panel-background-tasks.service.d/celery-rollback-patch.conf"; do
         if [ -f "$file" ]; then
             log_success "Найден: $file"
         else

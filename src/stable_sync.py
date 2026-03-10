@@ -1,13 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Стабильная синхронизация без SQLAlchemy v3.0
-РЕШЕНИЯ:
-✅ Прямые MySQL запросы вместо SQLAlchemy
-✅ Полная синхронизация пользователей со всеми полями  
-✅ Блокировка отсутствующих пользователей
-✅ Накопительная синхронизация трафика с обнулением
+Hiddify Manager Child-Parent User Synchronization v4.1
+
+Стабильная синхронизация пользователей и трафика между child и parent панелями.
+Использует прямые MySQL запросы (PyMySQL) вместо SQLAlchemy для надёжности.
+
+ОСНОВНАЯ ФУНКЦИОНАЛЬНОСТЬ:
+  - Получение списка пользователей с parent панели
+  - Создание новых пользователей на child сервере
+  - Обновление существующих пользователей (лимиты, статусы, ключи)
+  - Блокировка пользователей, отсутствующих на parent
+  - Накопительная синхронизация трафика (child → parent)
+  - Автоматическое обнуление локального трафика после успешной отправки
+  - Двунаправленная синхронизация last_online (child ↔ parent)
+  - Мгновенная активация новых пользователей в Xray (без перезапуска)
+
+ТРЕБОВАНИЯ:
+  - Hiddify Manager v11+ (child panel mode)
+  - Python 3.10+
+  - PyMySQL
+  - Доступ к parent панели через API
+
+Проект: https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+Лицензия: MIT
 """
+
 import sys
 import os
 import requests
@@ -19,10 +37,22 @@ import json
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Настройки подключения
-PARENT_URL = "https://my.fedoseev.one/rqkMip3ThY"
-API_KEY = "33eb7d42-f525-4871-a2d9-7986308757be"
-# Используем Unix socket аутентификацию для MySQL - должен работать с sudo
+# ============================================================================
+# КОНФИГУРАЦИЯ
+# Эти значения заменяются install.sh при установке.
+# Для ручной установки укажите свои значения.
+# ============================================================================
+
+# URL родительской панели (включая admin proxy path)
+# Пример: https://my.example.com/ADMIN_SECRET_PATH
+PARENT_URL = "https://your-parent-panel.example.com/ADMIN_PATH"
+
+# API ключ для доступа к parent панели
+# Получите в: Admin Panel → Settings → API Keys
+API_KEY = "your-api-key-here"
+
+# Конфигурация подключения к локальной базе данных MySQL
+# Использует Unix socket аутентификацию (требует запуск от root)
 DB_CONFIG = {
     'unix_socket': '/var/run/mysqld/mysqld.sock',
     'user': 'root',
@@ -30,13 +60,24 @@ DB_CONFIG = {
     'charset': 'utf8mb4'
 }
 
+# Минимальный объём трафика для отправки на parent (в байтах).
+# Трафик ниже этого порога накапливается локально до следующего цикла.
+# 1MB = 1000000 байт. Это предотвращает лишние API-запросы при малых объёмах.
+MIN_TRAFFIC_THRESHOLD = 1000000
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
+
 def log(message):
-    """Логирование с временной меткой"""
+    """Логирование с временной меткой. Вывод через stdout для systemd journald."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
+
 
 def get_db_connection():
-    """Получить подключение к базе данных"""
+    """Получить подключение к локальной базе данных MySQL."""
     try:
         connection = pymysql.connect(**DB_CONFIG)
         return connection
@@ -44,28 +85,81 @@ def get_db_connection():
         log(f"❌ Ошибка подключения к БД: {e}")
         return None
 
+
+def fetch_parent_users():
+    """
+    Получает полный список пользователей с parent панели (один GET-запрос).
+    Результат используется несколькими шагами синхронизации,
+    чтобы не делать повторных запросов.
+
+    Returns:
+        list | None: Список пользователей или None при ошибке
+    """
+    try:
+        response = requests.get(
+            f"{PARENT_URL}/api/v2/admin/user/",
+            headers={'Hiddify-API-Key': API_KEY},
+            verify=False,
+            timeout=60
+        )
+        if response.status_code != 200:
+            log(f"❌ Ошибка получения пользователей с parent: HTTP {response.status_code}")
+            return None
+        parent_users = response.json()
+        log(f"Получено {len(parent_users)} пользователей с parent панели")
+        return parent_users
+    except Exception as e:
+        log(f"❌ Ошибка запроса списка пользователей с parent: {e}")
+        return None
+
+
+def parse_datetime(dt_str):
+    """Парсит строку даты/времени из Hiddify API (формат: 'YYYY-MM-DD HH:MM:SS')."""
+    if not dt_str:
+        return None
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================================
+# СИНХРОНИЗАЦИЯ ТРАФИКА (CHILD → PARENT)
+#
+# Алгоритм накопительной синхронизации:
+# 1. Собираем локальный current_usage для пользователей > порога
+# 2. GET текущий трафик с parent для каждого пользователя
+# 3. new_usage = parent_usage + local_delta
+# 4. PATCH на parent с new_usage
+# 5. Обнуляем локальный current_usage (атомарная транзакция)
+#
+# Это гарантирует, что parent видит суммарный трафик со всех child-серверов.
+# ============================================================================
+
 def collect_local_usage_delta():
-    """Собираем локальную статистику для отправки на parent"""
+    """
+    Собирает локальную статистику трафика для отправки на parent.
+    Выбирает только пользователей с current_usage > MIN_TRAFFIC_THRESHOLD.
+    """
     try:
         conn = get_db_connection()
         if not conn:
             return []
-            
+
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Находим пользователей с трафиком > 0
             cursor.execute("""
-                SELECT uuid, name, current_usage, last_online 
-                FROM user 
-                WHERE current_usage > 1000000
-            """)  # Минимум 1MB
-            
+                SELECT uuid, name, current_usage, last_online
+                FROM user
+                WHERE current_usage > %s
+            """, (MIN_TRAFFIC_THRESHOLD,))
+
             users_with_usage = cursor.fetchall()
             usage_deltas = []
-            
-            log(f"Найдено {len(users_with_usage)} пользователей с трафиком")
-            
+
+            log(f"Найдено {len(users_with_usage)} пользователей с трафиком > {MIN_TRAFFIC_THRESHOLD/(1024**3):.3f}GB")
+
             for user in users_with_usage:
-                usage_gb = user['current_usage'] / (1024**3)  # Bytes to GB
+                usage_gb = user['current_usage'] / (1024**3)
                 if usage_gb > 0.001:
                     usage_deltas.append({
                         'uuid': user['uuid'],
@@ -74,15 +168,17 @@ def collect_local_usage_delta():
                         'name': user['name']
                     })
                     log(f"  {user['name']}: +{usage_gb:.3f}GB")
-                    
+
         conn.close()
         return usage_deltas
     except Exception as e:
         log(f"❌ Ошибка сбора статистики: {e}")
+        traceback.print_exc()
         return []
 
+
 def get_parent_user_usage(uuid):
-    """Получает текущую статистику пользователя с parent панели"""
+    """Получает текущий трафик пользователя с parent панели (в GB)."""
     try:
         response = requests.get(
             f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
@@ -91,9 +187,9 @@ def get_parent_user_usage(uuid):
             timeout=30
         )
         if response.status_code == 200:
-            user_data = response.json()
-            return user_data.get('current_usage_GB', 0)
+            return response.json().get('current_usage_GB', 0)
         elif response.status_code == 404:
+            log(f"⚠️  Пользователь {uuid[:8]}... не найден на parent")
             return 0
         else:
             log(f"❌ Ошибка получения пользователя: HTTP {response.status_code}")
@@ -102,10 +198,10 @@ def get_parent_user_usage(uuid):
         log(f"❌ Ошибка запроса к parent: {e}")
         return None
 
+
 def update_parent_user_usage(uuid, new_usage_gb, name="Unknown"):
-    """Обновляет статистику пользователя на parent панели"""
+    """Обновляет суммарный трафик пользователя на parent панели через PATCH."""
     try:
-        # Попробуем PATCH вместо PUT
         data = {"current_usage_GB": new_usage_gb}
         response = requests.patch(
             f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
@@ -115,6 +211,7 @@ def update_parent_user_usage(uuid, new_usage_gb, name="Unknown"):
             timeout=30
         )
         if response.status_code == 200:
+            log(f"✅ Обновлён трафик {name}: {new_usage_gb:.3f}GB")
             return True
         else:
             log(f"❌ Ошибка обновления {name}: HTTP {response.status_code} - {response.text[:200]}")
@@ -123,44 +220,49 @@ def update_parent_user_usage(uuid, new_usage_gb, name="Unknown"):
         log(f"❌ Ошибка обновления пользователя {name}: {e}")
         return False
 
+
 def send_usage_deltas_to_parent(usage_deltas):
-    """Отправляет дельта статистики на parent панель"""
+    """
+    Отправляет накопленную дельту трафика на parent панель.
+    Для каждого пользователя: new_usage = parent_usage + local_delta.
+    """
     if not usage_deltas:
         return True, 0
-    
-    log(f"Отправляю дельта статистики для {len(usage_deltas)} пользователей...")
-    
+
+    log(f"Отправка дельта статистики для {len(usage_deltas)} пользователей...")
+
     successful_updates = 0
     for delta in usage_deltas:
         uuid = delta['uuid']
         local_delta = delta['usage_delta_GB']
         name = delta.get('name', 'Unknown')
-        
-        # Получаем текущую статистику с parent
+
         parent_usage = get_parent_user_usage(uuid)
         if parent_usage is None:
             continue
-            
-        # Вычисляем новую статистику
+
         new_usage = parent_usage + local_delta
         log(f"Пользователь {name}: parent={parent_usage:.3f}GB + local={local_delta:.3f}GB = {new_usage:.3f}GB")
-        
-        # Обновляем на parent
+
         if update_parent_user_usage(uuid, new_usage, name):
             successful_updates += 1
-        
+
     success_rate = successful_updates == len(usage_deltas)
     log(f"{'✅' if success_rate else '⚠️'} {'Полностью' if success_rate else 'Частично'} успешно: {successful_updates}/{len(usage_deltas)} пользователей обновлено")
-    
+
     return success_rate, successful_updates
 
+
 def reset_local_usage(usage_deltas):
-    """Сбрасывает локальную статистику в 0 после успешной отправки"""
+    """
+    Сбрасывает локальный current_usage в 0 после успешной отправки на parent.
+    Это критично: без сброса трафик будет отправлен повторно.
+    """
     try:
         conn = get_db_connection()
         if not conn:
             return False
-            
+
         with conn.cursor() as cursor:
             reset_count = 0
             for delta in usage_deltas:
@@ -171,86 +273,194 @@ def reset_local_usage(usage_deltas):
                 if cursor.rowcount > 0:
                     reset_count += 1
                     log(f"Сброшен трафик для {delta['name']}: {delta['usage_delta_GB']:.3f}GB → 0GB")
-            
+
             conn.commit()
             log(f"✅ Сброшен локальный трафик для {reset_count} пользователей")
-            
+
         conn.close()
         return True
     except Exception as e:
         log(f"❌ Ошибка сброса локальной статистики: {e}")
+        traceback.print_exc()
         return False
 
-def sync_users_from_parent():
-    """ПОЛНАЯ синхронизация пользователей с parent панели"""
+
+# ============================================================================
+# СИНХРОНИЗАЦИЯ LAST_ONLINE (CHILD ↔ PARENT)
+#
+# Двунаправленная синхронизация: выигрывает более свежее значение.
+# Это важно, т.к. пользователь может подключаться через разные child-серверы,
+# а parent должен видеть самое актуальное время последнего подключения.
+# ============================================================================
+
+def sync_last_online(parent_users):
+    """
+    Двунаправленная синхронизация last_online между child и parent.
+
+    Для каждого пользователя сравнивает временные метки:
+      - Если local > parent → PATCH на parent (пользователь был активен здесь)
+      - Если parent > local → UPDATE в локальной БД (был активен на другом child)
+    """
     try:
-        # Получаем пользователей с parent
-        response = requests.get(
-            f"{PARENT_URL}/api/v2/admin/user/",
-            headers={'Hiddify-API-Key': API_KEY},
-            verify=False,
-            timeout=60
-        )
-        
-        if response.status_code != 200:
-            log(f"❌ Ошибка получения пользователей с parent: HTTP {response.status_code}")
-            return False
-            
-        parent_users = response.json()
-        log(f"Получено {len(parent_users)} пользователей с parent панели")
-        
         conn = get_db_connection()
         if not conn:
             return False
-            
+
+        # Строим карту parent last_online {uuid: {last_online, name}}
+        parent_online_map = {}
+        for pu in parent_users:
+            parent_online_map[pu['uuid']] = {
+                'last_online': parse_datetime(pu.get('last_online')),
+                'name': pu['name']
+            }
+
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            # Получаем всех локальных пользователей
+            cursor.execute("SELECT uuid, name, last_online FROM user")
+            local_users = cursor.fetchall()
+
+            pushed_count = 0
+            pulled_count = 0
+
+            for local_user in local_users:
+                uuid = local_user['uuid']
+                local_online = local_user['last_online']
+                name = local_user['name']
+
+                if uuid not in parent_online_map:
+                    continue
+
+                parent_online = parent_online_map[uuid]['last_online']
+
+                if local_online and parent_online:
+                    if local_online > parent_online:
+                        if _push_last_online_to_parent(uuid, local_online, name):
+                            pushed_count += 1
+                    elif parent_online > local_online:
+                        cursor.execute(
+                            "UPDATE user SET last_online = %s WHERE uuid = %s",
+                            (parent_online, uuid)
+                        )
+                        pulled_count += 1
+                elif local_online and not parent_online:
+                    if _push_last_online_to_parent(uuid, local_online, name):
+                        pushed_count += 1
+                elif parent_online and not local_online:
+                    cursor.execute(
+                        "UPDATE user SET last_online = %s WHERE uuid = %s",
+                        (parent_online, uuid)
+                    )
+                    pulled_count += 1
+
+            conn.commit()
+
+            if pushed_count or pulled_count:
+                log(f"✅ last_online: ↑{pushed_count} → parent, ↓{pulled_count} ← parent")
+            else:
+                log(f"last_online: всё актуально, обновлений не требуется")
+
+        conn.close()
+        return True
+    except Exception as e:
+        log(f"❌ Ошибка синхронизации last_online: {e}")
+        traceback.print_exc()
+        return False
+
+
+def _push_last_online_to_parent(uuid, local_online, name):
+    """Отправляет last_online одного пользователя на parent через PATCH."""
+    try:
+        data = {"last_online": local_online.strftime("%Y-%m-%d %H:%M:%S")}
+        response = requests.patch(
+            f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
+            headers={'Hiddify-API-Key': API_KEY},
+            json=data,
+            verify=False,
+            timeout=30
+        )
+        if response.status_code == 200:
+            return True
+        else:
+            log(f"  ⚠️ {name}: не удалось обновить last_online на parent: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        log(f"  ⚠️ {name}: ошибка отправки last_online: {e}")
+        return False
+
+
+# ============================================================================
+# СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ (PARENT → CHILD)
+#
+# Parent — единственный источник истины для:
+#   - Списка пользователей (создание/блокировка)
+#   - Лимитов, пакетов, статусов, ключей
+#
+# Child управляет локально:
+#   - current_usage (сбрасывается после отправки на parent)
+#   - last_online (синхронизируется отдельно в sync_last_online)
+# ============================================================================
+
+def sync_users_from_parent(parent_users):
+    """
+    Полная синхронизация пользователей с parent панели.
+
+    Создаёт новых, обновляет существующих, блокирует отсутствующих.
+    Новые пользователи мгновенно активируются в Xray через activate_new_users_direct.py.
+
+    Args:
+        parent_users: Список пользователей с parent (из fetch_parent_users)
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
             cursor.execute("SELECT uuid, name, enable FROM user")
             local_users = cursor.fetchall()
             local_uuids = {u['uuid'] for u in local_users}
             parent_uuids = {u['uuid'] for u in parent_users}
-            
+
             synced_count = 0
             blocked_count = 0
             unblocked_count = 0
             created_count = 0
-            created_uuids = []  # Список UUID новосозданных пользователей для активации
-            
-            # Синхронизируем пользователей с parent
+            created_uuids = []
+
             for parent_user in parent_users:
                 uuid = parent_user['uuid']
-                
-                # Проверяем существует ли пользователь
+
                 cursor.execute("SELECT id, enable FROM user WHERE uuid = %s", (uuid,))
                 existing_user = cursor.fetchone()
-                
+
                 if not existing_user:
-                    # Создаем нового пользователя
+                    # Создаём нового пользователя с пустыми username/password
+                    # (Hiddify использует UUID-авторизацию, НЕ генерируйте password!)
                     cursor.execute("""
                         INSERT INTO user (
-                            uuid, name, usage_limit, package_days, mode, enable, 
+                            uuid, name, usage_limit, package_days, mode, enable,
                             comment, start_date, last_reset_time, current_usage,
                             telegram_id, ed25519_private_key, ed25519_public_key,
-                            wg_pk, wg_psk, wg_pub, added_by, last_online, max_ips
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, 100)
+                            wg_pk, wg_psk, wg_pub, added_by, last_online, max_ips,
+                            username, password
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, NOW(), 2, '', '')
                     """, (
                         uuid, parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3),
                         parent_user['package_days'], parent_user['mode'], parent_user['enable'],
-                        parent_user.get('comment', ''), parent_user.get('start_date'), 
+                        parent_user.get('comment', ''), parent_user.get('start_date'),
                         parent_user.get('last_reset_time'), parent_user.get('telegram_id'),
                         parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
-                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''), 
-                        parent_user.get('wg_pub', ''), 1, datetime.now()  # admin ID=1, last_online
+                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''),
+                        parent_user.get('wg_pub', ''), 1
                     ))
                     created_count += 1
+                    created_uuids.append(uuid)
                     log(f"➕ Создан новый пользователь: {parent_user['name']}")
-                    created_uuids.append(uuid)  # Сохраняем UUID для активации
                 else:
-                    # КРИТИЧНО: Обновляем ВСЕ поля кроме current_usage и last_online
+                    # Обновляем все поля кроме current_usage и last_online
                     cursor.execute("""
-                        UPDATE user SET 
-                            name = %s, usage_limit = %s, package_days = %s, 
-                            mode = %s, enable = %s, comment = %s, start_date = %s, 
+                        UPDATE user SET
+                            name = %s, usage_limit = %s, package_days = %s,
+                            mode = %s, enable = %s, comment = %s, start_date = %s,
                             last_reset_time = %s, telegram_id = %s,
                             ed25519_private_key = %s, ed25519_public_key = %s,
                             wg_pk = %s, wg_psk = %s, wg_pub = %s, added_by = %s
@@ -261,12 +471,11 @@ def sync_users_from_parent():
                         parent_user.get('start_date'), parent_user.get('last_reset_time'),
                         parent_user.get('telegram_id'),
                         parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
-                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''), 
-                        parent_user.get('wg_pub', ''), 1,  # Используем admin ID=1
+                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''),
+                        parent_user.get('wg_pub', ''), 1,
                         uuid
                     ))
-                    
-                    # Проверяем изменение статуса блокировки
+
                     if existing_user['enable'] != parent_user['enable']:
                         if parent_user['enable']:
                             unblocked_count += 1
@@ -274,9 +483,9 @@ def sync_users_from_parent():
                         else:
                             blocked_count += 1
                             log(f"🚫 Заблокирован: {parent_user['name']}")
-                
+
                 synced_count += 1
-            
+
             # Блокируем пользователей, которых нет на parent
             missing_uuids = local_uuids - parent_uuids
             for uuid in missing_uuids:
@@ -286,13 +495,13 @@ def sync_users_from_parent():
                     cursor.execute("UPDATE user SET enable = 0 WHERE uuid = %s", (uuid,))
                     log(f"🚫 Заблокирован отсутствующий на parent: {user['name']}")
                     blocked_count += 1
-            
+
             conn.commit()
             log(f"✅ Синхронизация завершена: {synced_count} синхронизировано, {created_count} создано, {blocked_count} заблокировано, {unblocked_count} разблокировано")
-            
+
         conn.close()
 
-        # Активируем новосозданных пользователей в работающих прокси
+        # Мгновенная активация новых пользователей в работающем Xray
         if created_uuids:
             log(f"🔧 Активация {len(created_uuids)} новых пользователей в прокси...")
             try:
@@ -309,52 +518,80 @@ def sync_users_from_parent():
                     log(f"⚠️ Не удалось активировать пользователей: {result.stderr}")
             except Exception as e:
                 log(f"⚠️ Ошибка активации новых пользователей: {e}")
-                # Не критично - пользователи будут активированы при следующем apply_configs
 
         return True
-        
+
     except Exception as e:
         log(f"❌ Ошибка синхронизации пользователей: {e}")
         traceback.print_exc()
         return False
 
+
+# ============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ
+# ============================================================================
+
 def main():
-    """Главная функция накопительной синхронизации"""
-    log("=== ⚙ Starting Stable Accumulative Sync v3.0 ===")
-    
+    """
+    Главная функция накопительной синхронизации v4.1.
+
+    Последовательность операций:
+      1. Получаем список пользователей с parent (один GET-запрос)
+      2. Собираем локальную дельту трафика
+      3. Отправляем дельту на parent (накопительно)
+      4. Сбрасываем локальный трафик в 0
+      5. Синхронизируем last_online (двунаправленно)
+      6. Синхронизируем пользователей (parent → child)
+    """
+    log("=== ⚙ Starting Stable Accumulative Sync v4.1 ===")
+
     try:
-        # Шаг 1: Собираем локальную статистику
-        log("Step 1: Собираем локальную дельта статистику...")
+        # Шаг 1: Получаем пользователей с parent (один раз для всех шагов)
+        log("Step 1: Получаем список пользователей с parent...")
+        parent_users = fetch_parent_users()
+        if parent_users is None:
+            log("❌ Невозможно продолжить без данных с parent")
+            return False
+
+        # Шаг 2: Собираем локальную статистику
+        log("Step 2: Собираем локальную дельта статистику...")
         usage_deltas = collect_local_usage_delta()
         log(f"Собрано дельта статистики для {len(usage_deltas)} пользователей")
-        
-        # Шаг 2: Отправляем статистику на parent
+
+        # Шаг 3-4: Отправляем на parent и сбрасываем локально
         if usage_deltas:
-            log("Step 2: Отправляем дельта статистику на parent...")
+            log("Step 3: Отправляем дельта статистику на parent...")
             success, updated_count = send_usage_deltas_to_parent(usage_deltas)
-            
+
             if success:
-                # Шаг 3: Сбрасываем локальную статистику
-                log("Step 3: Сбрасываем локальную статистику в ноль...")
+                log("Step 4: Сбрасываем локальную статистику в ноль...")
                 if reset_local_usage(usage_deltas):
                     log(f"✅ Локальная статистика сброшена для {len(usage_deltas)} пользователей")
         else:
-            log("Step 2: Нет дельта статистики для отправки")
-        
-        # Шаг 4: ПОЛНАЯ синхронизация пользователей
-        log("Step 4: Полная синхронизация пользователей с parent...")
-        if sync_users_from_parent():
+            log("Step 3: Нет дельта статистики для отправки")
+
+        # Шаг 5: Двунаправленная синхронизация last_online
+        log("Step 5: Синхронизация last_online (child ↔ parent)...")
+        if sync_last_online(parent_users):
+            log("✅ Синхронизация last_online завершена")
+        else:
+            log("⚠️ Ошибка синхронизации last_online")
+
+        # Шаг 6: Полная синхронизация пользователей
+        log("Step 6: Полная синхронизация пользователей с parent...")
+        if sync_users_from_parent(parent_users):
             log("✅ Синхронизация пользователей завершена успешно")
         else:
             log("❌ Ошибка синхронизации пользователей")
-        
+
         log("✅ Stable sync completed successfully!")
         return True
-        
+
     except Exception as e:
         log(f"❌ Критическая ошибка в синхронизации: {e}")
         traceback.print_exc()
         return False
+
 
 if __name__ == "__main__":
     success = main()

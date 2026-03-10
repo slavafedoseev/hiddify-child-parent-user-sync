@@ -7,6 +7,61 @@
 
 ---
 
+## [3.0] - 2026-03-11
+
+### ✨ Добавлено
+
+- **Двунаправленная синхронизация `last_online`** (child ↔ parent)
+  - При каждом цикле синхронизации сравнивается `last_online` на child и parent
+  - Если пользователь был активен на этом child → обновляется parent
+  - Если пользователь был активен на другом child → обновляется локальная БД
+  - Parent всегда видит самое свежее время последнего подключения со всех серверов
+
+- **Автопатч Celery PendingRollbackError** — стабилизация фонового сервиса Hiddify
+  - Новый компонент `hiddify-patch-celery-rollback.py` — идемпотентный патчер
+  - Исправляет архитектурный баг в Hiddify: общая SQLAlchemy-сессия в Celery solo pool
+    не очищается при ошибках, что приводит к каскадному `PendingRollbackError`
+  - Systemd drop-in `celery-rollback-patch.conf` — патч применяется автоматически
+    при каждом запуске `hiddify-panel-background-tasks.service` (переживает обновления Hiddify)
+
+- **Оптимизация API-вызовов** — parent-пользователи загружаются одним GET-запросом
+  и передаются во все шаги синхронизации (вместо дублирования запросов)
+
+### 🔧 Изменено
+
+- **`stable_sync.py` v3.0 → v4.1**
+  - Новый шаг 5: двунаправленная синхронизация `last_online`
+  - Вынесена функция `fetch_parent_users()` — один запрос для всех шагов
+  - `sync_users_from_parent()` принимает `parent_users` как аргумент
+  - Добавлены хелперы: `parse_datetime()`, `_push_last_online_to_parent()`
+  - Расширены комментарии и docstrings
+
+- **`install.sh`**
+  - Установка `hiddify-patch-celery-rollback.py` и systemd drop-in
+  - Создание директории для drop-in конфигурации
+  - Обновлённая проверка компонентов
+
+### 🐛 Исправлено
+
+- Устранён критический баг: `last_online` не передавался на parent панель,
+  из-за чего parent показывал устаревшие данные о последнем подключении
+- Устранена нестабильность Celery background tasks (`PendingRollbackError`),
+  которая приводила к остановке сбора статистики трафика на 8+ дней
+
+### 📚 Техническая информация
+
+**Новые файлы:**
+- `src/hiddify-patch-celery-rollback.py` — автопатчер для Celery session rollback
+- `systemd/celery-rollback-patch.conf` — systemd drop-in для автоприменения патча
+
+**Изменённые файлы:**
+- `src/stable_sync.py` — добавлена синхронизация `last_online`, рефакторинг
+- `install.sh` — установка новых компонентов
+- `README.md` — обновлена документация
+- `CHANGELOG.md` — описание версии 3.0
+
+---
+
 ## [2.0] - 2025-12-23
 
 ### ✨ Добавлено
