@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hiddify Manager Child-Parent User Synchronization v4.2
+Hiddify Manager Child-Parent User Synchronization v4.3
 
 Стабильная синхронизация пользователей и трафика между child и parent панелями.
 Использует прямые MySQL запросы (PyMySQL) вместо SQLAlchemy для надёжности.
@@ -417,6 +417,28 @@ def _delete_missing_users(missing_uuids):
     return deleted
 
 
+def _run_xray_helper(script_path, uuids, label):
+    """
+    Запускает helper активации/деактивации Xray (subprocess; venv-питон в shebang скрипта).
+    Идемпотентные операции над работающим Xray по gRPC. uuids — список UUID.
+    """
+    if not uuids:
+        return
+    try:
+        import subprocess
+        result = subprocess.run(
+            [script_path] + list(uuids),
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            summary = (result.stdout.strip().splitlines() or [''])[-1]
+            log(f"✅ Xray {label}: {summary}")
+        else:
+            log(f"⚠️ Ошибка {label} в Xray: {result.stderr[:200]}")
+    except Exception as e:
+        log(f"⚠️ Сбой {label} в Xray: {e}")
+
+
 # ============================================================================
 # СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ (PARENT → CHILD)
 #
@@ -433,8 +455,12 @@ def sync_users_from_parent(parent_users):
     """
     Полная синхронизация пользователей с parent панели.
 
-    Создаёт новых, обновляет существующих, блокирует отсутствующих.
-    Новые пользователи мгновенно активируются в Xray через activate_new_users_direct.py.
+    Создаёт новых, обновляет существующих, УДАЛЯЕТ отсутствующих на parent.
+    Состояние child-enable и членство в работающем Xray определяются по parent.is_active
+    (ground-truth: учитывает блокировку, исчерпание трафика и истечение срока):
+      - is_active=True  → enable=1, юзер ДОБАВЛЯЕТСЯ в Xray (activate_new_users_direct.py);
+      - is_active=False → enable=0, юзер УДАЛЯЕТСЯ из Xray (deactivate_users_direct.py),
+        соединение рвётся немедленно, не дожидаясь фоновой реконсиляции Hiddify.
 
     Args:
         parent_users: Список пользователей с parent (из fetch_parent_users)
@@ -455,9 +481,19 @@ def sync_users_from_parent(parent_users):
             unblocked_count = 0
             created_count = 0
             created_uuids = []
+            activate_uuids = []   # созданные-активные + разблокированные (0→1) → добавить в Xray
+            inactive_uuids = []   # все is_active=False на parent → удалить из Xray (идемпотентно)
 
             for parent_user in parent_users:
                 uuid = parent_user['uuid']
+
+                # is_active = ground-truth parent: enable И не истёк срок И не превышена квота.
+                # Именно он (а НЕ голый enable) определяет, должен ли юзер быть подключаем на child:
+                # при исчерпании трафика/дней parent оставляет enable=1, но is_active=False.
+                is_active = bool(parent_user.get('is_active', parent_user['enable']))
+                desired_enable = 1 if is_active else 0
+                if not is_active:
+                    inactive_uuids.append(uuid)
 
                 cursor.execute("SELECT id, enable FROM user WHERE uuid = %s", (uuid,))
                 existing_user = cursor.fetchone()
@@ -475,7 +511,7 @@ def sync_users_from_parent(parent_users):
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, NOW(), 2, '', '')
                     """, (
                         uuid, parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3),
-                        parent_user['package_days'], parent_user['mode'], parent_user['enable'],
+                        parent_user['package_days'], parent_user['mode'], desired_enable,
                         parent_user.get('comment', ''), parent_user.get('start_date'),
                         parent_user.get('last_reset_time'), parent_user.get('telegram_id'),
                         parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
@@ -484,6 +520,8 @@ def sync_users_from_parent(parent_users):
                     ))
                     created_count += 1
                     created_uuids.append(uuid)
+                    if is_active:
+                        activate_uuids.append(uuid)   # сразу подключаем в Xray
                     log(f"➕ Создан новый пользователь: {parent_user['name']}")
                 else:
                     # Обновляем все поля кроме current_usage и last_online
@@ -497,7 +535,7 @@ def sync_users_from_parent(parent_users):
                         WHERE uuid = %s
                     """, (
                         parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3), parent_user['package_days'],
-                        parent_user['mode'], parent_user['enable'], parent_user.get('comment', ''),
+                        parent_user['mode'], desired_enable, parent_user.get('comment', ''),
                         parent_user.get('start_date'), parent_user.get('last_reset_time'),
                         parent_user.get('telegram_id'),
                         parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
@@ -506,13 +544,15 @@ def sync_users_from_parent(parent_users):
                         uuid
                     ))
 
-                    if existing_user['enable'] != parent_user['enable']:
-                        if parent_user['enable']:
+                    if existing_user['enable'] != desired_enable:
+                        if desired_enable:
                             unblocked_count += 1
+                            activate_uuids.append(uuid)   # 0→1: вернуть в Xray
                             log(f"✅ Разблокирован: {parent_user['name']}")
                         else:
                             blocked_count += 1
                             log(f"🚫 Заблокирован: {parent_user['name']}")
+                            # удаление из Xray — ниже, через inactive_uuids (он уже там)
 
                 synced_count += 1
 
@@ -537,23 +577,13 @@ def sync_users_from_parent(parent_users):
         if deleted_count:
             log(f"🗑️  Удалено отсутствующих на parent: {deleted_count}")
 
-        # Мгновенная активация новых пользователей в работающем Xray
-        if created_uuids:
-            log(f"🔧 Активация {len(created_uuids)} новых пользователей в прокси...")
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['/opt/hiddify-manager/activate_new_users_direct.py'] + created_uuids,
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                if result.returncode == 0:
-                    log(f"✅ Новые пользователи активированы в прокси")
-                else:
-                    log(f"⚠️ Не удалось активировать пользователей: {result.stderr}")
-            except Exception as e:
-                log(f"⚠️ Ошибка активации новых пользователей: {e}")
+        # Деактивация в Xray всех неактивных (is_active=False: блокировка/квота/срок).
+        # Идемпотентно и КАЖДЫЙ цикл (самовосстановление) — child немедленно рвёт соединение,
+        # не дожидаясь фоновой реконсиляции Hiddify. Уже отсутствующие в Xray = no-op.
+        _run_xray_helper('/opt/hiddify-manager/deactivate_users_direct.py', inactive_uuids, 'деактивация')
+
+        # Мгновенная активация в Xray новых и разблокированных (is_active=True)
+        _run_xray_helper('/opt/hiddify-manager/activate_new_users_direct.py', activate_uuids, 'активация')
 
         return True
 
@@ -569,7 +599,7 @@ def sync_users_from_parent(parent_users):
 
 def main():
     """
-    Главная функция накопительной синхронизации v4.2.
+    Главная функция накопительной синхронизации v4.3.
 
     Последовательность операций:
       1. Получаем список пользователей с parent (один GET-запрос)
@@ -579,7 +609,7 @@ def main():
       5. Синхронизируем last_online (двунаправленно)
       6. Синхронизируем пользователей (parent → child)
     """
-    log("=== ⚙ Starting Stable Accumulative Sync v4.2 ===")
+    log("=== ⚙ Starting Stable Accumulative Sync v4.3 ===")
 
     try:
         # Шаг 1: Получаем пользователей с parent (один раз для всех шагов)
