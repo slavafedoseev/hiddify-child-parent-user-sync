@@ -5,6 +5,8 @@
 чтобы PendingRollbackError не накапливался в shared SQLAlchemy session.
 
 Запускается автоматически перед стартом hiddify-panel-background-tasks.service.
+Запуск настроен с префиксом systemd "+-" (от root, провал не валит юнит).
+Дополнительно: запись обёрнута в try/except, любые ошибки -> exit 0.
 """
 
 import sys
@@ -55,8 +57,12 @@ def patch_file(filepath):
         target + "\n" + PATCH_BLOCK
     )
 
-    with open(filepath, 'w') as f:
-        f.write(patched)
+    try:
+        with open(filepath, 'w') as f:
+            f.write(patched)
+    except (PermissionError, OSError) as e:
+        print(f"[celery-patch] WARNING: cannot write {filepath}: {e}")
+        return False
 
     print(f"[celery-patch] Successfully patched: {filepath}")
     return True
@@ -65,10 +71,14 @@ def patch_file(filepath):
 def main():
     filepath = find_usage_py()
     if not filepath:
-        print("[celery-patch] ERROR: usage.py not found!")
-        sys.exit(1)
+        print("[celery-patch] WARNING: usage.py not found, skipping (exit 0)")
+        return
 
-    patch_file(filepath)
+    try:
+        patch_file(filepath)
+    except Exception as e:
+        # Никогда не валим старт сервиса из-за патчера
+        print(f"[celery-patch] WARNING: unexpected error, skipping: {e}")
 
 
 if __name__ == "__main__":
