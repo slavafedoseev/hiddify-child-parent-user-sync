@@ -330,6 +330,7 @@ verify_installation() {
     for file in "/opt/hiddify-manager/stable_sync.py" \
                 "/opt/hiddify-manager/sync_health_api.py" \
                 "/opt/hiddify-manager/activate_new_users_direct.py" \
+                "/opt/hiddify-manager/deactivate_users_direct.py" \
                 "/usr/local/bin/hiddify-patch-celery-rollback.py" \
                 "/etc/systemd/system/hiddify-child-sync.service" \
                 "/etc/systemd/system/hiddify-child-sync.timer" \
