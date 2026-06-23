@@ -34,28 +34,31 @@ RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================================
 
+# ВАЖНО: все лог/декор-сообщения идут в stderr (>&2), чтобы не загрязнять stdout.
+# Иначе command substitution вида temp_dir=$(download_files) захватывала бы лог-строки
+# вместе с возвращаемым путём (баг «File name too long» при cp).
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
+    echo -e "${GREEN}[✓]${NC} $1" >&2
 }
 
 log_warning() {
-    echo -e "${YELLOW}[⚠]${NC} $1"
+    echo -e "${YELLOW}[⚠]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[✗]${NC} $1"
+    echo -e "${RED}[✗]${NC} $1" >&2
 }
 
 print_header() {
-    echo ""
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE} $1${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
+    echo "" >&2
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}" >&2
+    echo -e "${BLUE} $1${NC}" >&2
+    echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}" >&2
+    echo "" >&2
 }
 
 check_root() {
@@ -186,27 +189,27 @@ download_files() {
     mkdir -p "$temp_dir"
 
     log_info "Загрузка stable_sync.py..."
-    curl -fsSL "${RAW_URL}/src/stable_sync.py" -o "$temp_dir/stable_sync.py"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/stable_sync.py" -o "$temp_dir/stable_sync.py"
 
     log_info "Загрузка sync_health_api.py..."
-    curl -fsSL "${RAW_URL}/src/sync_health_api.py" -o "$temp_dir/sync_health_api.py"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/sync_health_api.py" -o "$temp_dir/sync_health_api.py"
 
     log_info "Загрузка activate_new_users_direct.py..."
-    curl -fsSL "${RAW_URL}/src/activate_new_users_direct.py" -o "$temp_dir/activate_new_users_direct.py"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/activate_new_users_direct.py" -o "$temp_dir/activate_new_users_direct.py"
 
     log_info "Загрузка deactivate_users_direct.py..."
-    curl -fsSL "${RAW_URL}/src/deactivate_users_direct.py" -o "$temp_dir/deactivate_users_direct.py"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/deactivate_users_direct.py" -o "$temp_dir/deactivate_users_direct.py"
 
     log_info "Загрузка systemd файлов..."
-    curl -fsSL "${RAW_URL}/systemd/hiddify-child-sync.service" -o "$temp_dir/hiddify-child-sync.service"
-    curl -fsSL "${RAW_URL}/systemd/hiddify-child-sync.timer" -o "$temp_dir/hiddify-child-sync.timer"
-    curl -fsSL "${RAW_URL}/systemd/hiddify-sync-api.service" -o "$temp_dir/hiddify-sync-api.service"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/hiddify-child-sync.service" -o "$temp_dir/hiddify-child-sync.service"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/hiddify-child-sync.timer" -o "$temp_dir/hiddify-child-sync.timer"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/hiddify-sync-api.service" -o "$temp_dir/hiddify-sync-api.service"
 
     log_info "Загрузка hiddify-patch-celery-rollback.py..."
-    curl -fsSL "${RAW_URL}/src/hiddify-patch-celery-rollback.py" -o "$temp_dir/hiddify-patch-celery-rollback.py"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/hiddify-patch-celery-rollback.py" -o "$temp_dir/hiddify-patch-celery-rollback.py"
 
     log_info "Загрузка celery-rollback-patch.conf..."
-    curl -fsSL "${RAW_URL}/systemd/celery-rollback-patch.conf" -o "$temp_dir/celery-rollback-patch.conf"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/celery-rollback-patch.conf" -o "$temp_dir/celery-rollback-patch.conf"
 
     log_success "Все файлы загружены"
 
