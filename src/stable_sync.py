@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hiddify Manager Child-Parent User Synchronization v4.1
+Hiddify Manager Child-Parent User Synchronization v4.2
 
 Стабильная синхронизация пользователей и трафика между child и parent панелями.
 Использует прямые MySQL запросы (PyMySQL) вместо SQLAlchemy для надёжности.
@@ -50,6 +50,11 @@ PARENT_URL = "https://your-parent-panel.example.com/ADMIN_PATH"
 # API ключ для доступа к parent панели
 # Получите в: Admin Panel → Settings → API Keys
 API_KEY = "your-api-key-here"
+
+# URL ЛОКАЛЬНОЙ (child) панели для УДАЛЕНИЯ отсутствующих на parent юзеров.
+# admin proxy-path идентичен parent -> деривируем из PARENT_URL. Удаление через Hiddify-API
+# (а не прямой SQL) делает каскад БД (user_detail) + удаление из работающего Xray (gRPC RemoveUser).
+CHILD_URL = "http://127.0.0.1:9000/" + PARENT_URL.rstrip("/").rsplit("/", 1)[-1]
 
 # Конфигурация подключения к локальной базе данных MySQL
 # Использует Unix socket аутентификацию (требует запуск от root)
@@ -387,6 +392,31 @@ def _push_last_online_to_parent(uuid, local_online, name):
         return False
 
 
+def _delete_missing_users(missing_uuids):
+    """Удаляет юзеров, отсутствующих на parent, через ЛОКАЛЬНЫЙ admin-API child.
+    Hiddify сам делает каскад БД (user_detail) + удаление из работающего Xray (gRPC RemoveUser).
+    Раньше таких БЛОКИРОВАЛИ (enable=0) -> они висели на child и попадали в агрегацию подписки."""
+    deleted = 0
+    for uuid in missing_uuids:
+        try:
+            response = requests.delete(
+                f"{CHILD_URL}/api/v2/admin/user/{uuid}/",
+                # Без явного Host: локальный admin-API (127.0.0.1:9000) принимает
+                # дефолтный Host запроса — механизм не привязан к конкретному домену.
+                headers={'Hiddify-API-Key': API_KEY},
+                verify=False,
+                timeout=30
+            )
+            if response.status_code in (200, 204):
+                deleted += 1
+                log(f"🗑️  Удалён отсутствующий на parent: {uuid[:8]}…")
+            else:
+                log(f"  ⚠️ Не удалён {uuid[:8]}…: HTTP {response.status_code}")
+        except Exception as e:
+            log(f"  ⚠️ Ошибка удаления {uuid[:8]}…: {e}")
+    return deleted
+
+
 # ============================================================================
 # СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ (PARENT → CHILD)
 #
@@ -486,20 +516,26 @@ def sync_users_from_parent(parent_users):
 
                 synced_count += 1
 
-            # Блокируем пользователей, которых нет на parent
-            missing_uuids = local_uuids - parent_uuids
-            for uuid in missing_uuids:
-                cursor.execute("SELECT name, enable FROM user WHERE uuid = %s", (uuid,))
-                user = cursor.fetchone()
-                if user and user['enable']:
-                    cursor.execute("UPDATE user SET enable = 0 WHERE uuid = %s", (uuid,))
-                    log(f"🚫 Заблокирован отсутствующий на parent: {user['name']}")
-                    blocked_count += 1
+            # Отсутствующих на parent — НЕ блокируем (раньше висели как disabled и попадали в
+            # агрегацию подписки), а УДАЛЯЕМ после коммита через admin-API child.
+            # SAFEGUARD: защита от mass-delete при сбое fetch_parent_users (пустой/частичный список):
+            # не удаляем, если parent пуст ИЛИ к удалению >25% локальных (>10 шт).
+            missing_uuids = list(local_uuids - parent_uuids)
+            if not parent_uuids or len(missing_uuids) > max(10, int(len(local_uuids) * 0.25)):
+                log(f"⚠️ Удаление ПРОПУЩЕНО (safeguard): missing={len(missing_uuids)}, "
+                    f"parent={len(parent_uuids)}, local={len(local_uuids)} — подозрение на сбой fetch")
+                missing_uuids = []
 
             conn.commit()
-            log(f"✅ Синхронизация завершена: {synced_count} синхронизировано, {created_count} создано, {blocked_count} заблокировано, {unblocked_count} разблокировано")
+            log(f"✅ Синхронизация: {synced_count} синхр, {created_count} создано, "
+                f"{blocked_count} заблок, {unblocked_count} разблок")
 
         conn.close()
+
+        # Удаление отсутствующих на parent через admin-API child (каскад БД + Xray), ВНЕ транзакции
+        deleted_count = _delete_missing_users(missing_uuids)
+        if deleted_count:
+            log(f"🗑️  Удалено отсутствующих на parent: {deleted_count}")
 
         # Мгновенная активация новых пользователей в работающем Xray
         if created_uuids:
@@ -533,7 +569,7 @@ def sync_users_from_parent(parent_users):
 
 def main():
     """
-    Главная функция накопительной синхронизации v4.1.
+    Главная функция накопительной синхронизации v4.2.
 
     Последовательность операций:
       1. Получаем список пользователей с parent (один GET-запрос)
@@ -543,7 +579,7 @@ def main():
       5. Синхронизируем last_online (двунаправленно)
       6. Синхронизируем пользователей (parent → child)
     """
-    log("=== ⚙ Starting Stable Accumulative Sync v4.1 ===")
+    log("=== ⚙ Starting Stable Accumulative Sync v4.2 ===")
 
     try:
         # Шаг 1: Получаем пользователей с parent (один раз для всех шагов)
