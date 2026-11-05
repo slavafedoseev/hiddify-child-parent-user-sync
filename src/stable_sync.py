@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hiddify Manager Child-Parent User Synchronization v4.4
+Hiddify Manager Child-Parent User Synchronization v4.4.1
 
 Стабильная синхронизация пользователей и трафика между child и parent панелями.
 Использует прямые MySQL запросы (PyMySQL) вместо SQLAlchemy для надёжности.
@@ -801,12 +801,17 @@ def _run_apply_users():
     return p.returncode
 
 
-def _drift(expected, xray_set, sb_set):
+def _drift(expected, xray_set, sb_set, known=None):
+    """known — все uuid юзеров child (активные и нет). «Лишними» считаются только известные БД,
+    но неактивные юзеры: статические идентификаторы inbound'ов в формате UUID (например, общий
+    пароль ShadowTLS v3 в 05_inbounds_*_shadowtls.json) юзерами не являются и не должны
+    каждый цикл запускать apply_users (v4.4.1)."""
     out = []
     for name, s in (('xray', xray_set), ('sing-box', sb_set)):
         if s is None:
             continue
-        miss, extra = expected - s, s - expected
+        miss = expected - s
+        extra = (s - expected) if known is None else ((s & known) - expected)
         if miss or extra:
             out.append(f"{name}: нет {len(miss)}, лишних {len(extra)}")
     return out
@@ -824,11 +829,12 @@ def ensure_engines_applied(changed):
         if child is None:
             return
         expected = {u.lower() for u, v in child.items() if v.get('is_active')}
-        drift = _drift(expected, *_rendered_uuid_sets())
+        known = {u.lower() for u in child}
+        drift = _drift(expected, *_rendered_uuid_sets(), known=known)
         if drift:
             log(f"🔧 Расхождение rendered↔БД ({'; '.join(drift)}) → install.sh apply_users")
             if _run_apply_users() == 0:
-                drift = _drift(expected, *_rendered_uuid_sets())
+                drift = _drift(expected, *_rendered_uuid_sets(), known=known)
                 log("✅ Движки согласованы с БД после apply_users" if not drift
                     else f"❌ Расхождение сохраняется: {'; '.join(drift)}")
         else:
@@ -863,7 +869,7 @@ def main():
       5. Синхронизируем last_online (двунаправленно)
       6. Синхронизируем пользователей (parent → child)
     """
-    log("=== ⚙ Starting Stable Accumulative Sync v4.4 ===" + (" [DRY-RUN]" if DRY_RUN else ""))
+    log("=== ⚙ Starting Stable Accumulative Sync v4.4.1 ===" + (" [DRY-RUN]" if DRY_RUN else ""))
 
     try:
         # Шаг 1: Получаем пользователей с parent (один раз для всех шагов)
