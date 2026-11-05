@@ -7,6 +7,44 @@
 
 ---
 
+## [4.4] - 2026-11-05
+
+### 🎯 Главное
+Новые пользователи начинают работать **по всем протоколам сразу** (VLESS/VMess/Trojan,
+Hysteria2, TUIC, ShadowTLS, Mieru, WireGuard), без рестарта дочерней панели. До v4.4 синк
+писал пользователя raw-SQL в MySQL и «горячо» добавлял его только в работающий Xray, поэтому
+sing-box-протоколы и WireGuard видели его лишь после `apply_users`/рестарта, а trojan не
+добавлялся даже в Xray (баг `flow` в xtlsapi 3.3.0, ошибка молча глоталась).
+
+### ✨ Добавлено
+- Создание/изменение/удаление пользователей через **локальный admin-API** child-панели
+  (`POST/PATCH/DELETE /api/v2/admin/user/`): панель сама делает gRPC hot-add в Xray и
+  (где умеет) `apply_users`; PATCH только по реальному диффу полей.
+- **Реконсиляция движков с БД каждый цикл** (`ensure_engines_applied`): сверяет UUID
+  в отрендеренных конфигах xray/sing-box с `is_active` в БД и при расхождении запускает
+  `install.sh apply_users --no-gui --no-log` (jinja-перерендер → reload sing-box →
+  пересборка WireGuard). Это компенсирует Hiddify 12.3.3, где нативный `apply_users`
+  после добавления через API не срабатывает. Ожидание чужого lock-файла (`log/0-install.lock`),
+  таймауты, лог `log/system/sync-apply-users.log`.
+- `--dry-run`: показать планируемые операции по пользователям, ничего не меняя
+  (трафик и last_online тоже не трогаются).
+- `src/hiddify-patch-xtlsapi-trojan.py` + drop-in `hiddify-panel.service.d/xtlsapi-trojan-patch.conf`
+  (ExecStartPre): идемпотентный патч xtlsapi — `flow` передаётся только если поле есть в proto;
+  переживает обновления панели.
+- Drop-in `hiddify-child-sync.service.d/10-apply-timeout.conf` (`TimeoutStartSec=900`).
+- `install.sh` 5.1: ставит и проверяет новые компоненты, права `0640` на `stable_sync.py`
+  (в нём API-ключ parent), перезапуск `hiddify-panel` после патча.
+- `docs/RUNBOOK-v4.4.md`: обновление существующей дочерней панели, установка на новую,
+  проверка с тест-клиента, откат.
+
+### ⚠️ Поведение
+- Каждое добавление/изменение пользователя, требующее перерендера, вызывает `apply_users`:
+  reload sing-box (SIGHUP), пересоздание интерфейса WireGuard (`wg-quick`), на некоторых
+  панелях — рестарт Xray. У клиентов кратко (секунды) рвутся сессии; PATCH по диффу и
+  ожидание lock сводят это к одному apply на цикл.
+- Без `--dry-run` первый запуск v4.4 на панели со «старыми» пользователями, которых нет в
+  рендере, сразу выполнит `apply_users` (это и есть починка).
+
 ## [4.3] - 2026-06-23
 
 ### ✨ Добавлено

@@ -1,10 +1,28 @@
-# Hiddify Manager - Child→Parent User Synchronization v3.0
+# Hiddify Manager - Child→Parent User Synchronization v4.4
 
 **Надёжная автоматическая синхронизация пользователей и трафика между child и parent панелями Hiddify Manager с мгновенной активацией новых пользователей**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Hiddify Manager](https://img.shields.io/badge/Hiddify-v11.0.12b1+-blue.svg)](https://github.com/hiddify/hiddify-manager)
 [![Python](https://img.shields.io/badge/Python-3.13+-green.svg)](https://www.python.org/)
+
+---
+
+## 🆕 v4.4 — пользователи работают по всем протоколам без рестарта
+
+До v4.4 новый пользователь после синхронизации работал на child-панели только по
+VLESS/VMess: синк писал его в MySQL и «горячо» добавлял в работающий Xray, а sing-box
+(Hysteria2, TUIC, ShadowTLS/SS, Mieru, Naive) и WireGuard получали его лишь после
+`apply_users` или рестарта; trojan не добавлялся даже в Xray (баг xtlsapi). v4.4:
+
+- пользователи создаются/меняются/удаляются через **локальный admin-API** child-панели;
+- каждый цикл **реконсиляция**: UUID в отрендеренных конфигах xray/sing-box сверяются с БД,
+  при расхождении запускается `install.sh apply_users` (перерендер → reload sing-box →
+  пересборка WireGuard); лог `/opt/hiddify-manager/log/system/sync-apply-users.log`;
+- патч xtlsapi для hot-add trojan (переприменяется при каждом старте `hiddify-panel`);
+- `--dry-run` показывает план без изменений.
+
+Обновление и установка: см. [docs/RUNBOOK-v4.4.md](docs/RUNBOOK-v4.4.md).
 
 ---
 

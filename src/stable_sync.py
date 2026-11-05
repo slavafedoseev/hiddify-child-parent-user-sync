@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hiddify Manager Child-Parent User Synchronization v4.3
+Hiddify Manager Child-Parent User Synchronization v4.4
 
 Стабильная синхронизация пользователей и трафика между child и parent панелями.
 Использует прямые MySQL запросы (PyMySQL) вместо SQLAlchemy для надёжности.
@@ -14,7 +14,11 @@ Hiddify Manager Child-Parent User Synchronization v4.3
   - Накопительная синхронизация трафика (child → parent)
   - Автоматическое обнуление локального трафика после успешной отправки
   - Двунаправленная синхронизация last_online (child ↔ parent)
-  - Мгновенная активация новых пользователей в Xray (без перезапуска)
+  - Создание/изменение/удаление юзеров через локальный admin-API child → панель сама делает
+    gRPC hot-add в Xray и `install.sh apply_users` (sing-box reload + WireGuard) — новые юзеры
+    работают по ВСЕМ протоколам без перезагрузки сервера
+  - Реконсиляция rendered-конфигов движков с БД каждый цикл (самовосстановление)
+  - Режим --dry-run: показать планируемые операции, ничего не меняя
 
 ТРЕБОВАНИЯ:
   - Hiddify Manager v11+ (child panel mode)
@@ -34,6 +38,10 @@ from datetime import datetime, date
 import urllib3
 import traceback
 import json
+import re
+import glob
+import time
+import subprocess
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -440,152 +448,272 @@ def _run_xray_helper(script_path, uuids, label):
 
 
 # ============================================================================
-# СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ (PARENT → CHILD)
+# СИНХРОНИЗАЦИЯ ПОЛЬЗОВАТЕЛЕЙ (PARENT → CHILD) — v4.4 «нативный путь»
 #
-# Parent — единственный источник истины для:
-#   - Списка пользователей (создание/блокировка)
-#   - Лимитов, пакетов, статусов, ключей
+# Parent — единственный источник истины для списка пользователей, лимитов, статусов, ключей.
+# Child управляет локально: current_usage (сбрасывается после отправки на parent), last_online.
 #
-# Child управляет локально:
-#   - current_usage (сбрасывается после отправки на parent)
-#   - last_online (синхронизируется отдельно в sync_last_online)
+# v4.4: создание/изменение/удаление выполняются через ЛОКАЛЬНЫЙ admin-API child
+# (POST/PATCH/DELETE /api/v2/admin/user/), а НЕ raw-SQL. Панель Hiddify при этом делает ровно то,
+# что делает при ручном добавлении юзера: gRPC hot-add в Xray (user_driver.add_client) и
+# `install.sh apply_users` (jinja-перерендер конфигов из БД → SIGHUP-reload sing-box,
+# пересборка WireGuard-пиров). Без второго шага sing-box (Hysteria2/TUIC/Mieru/Naive/SS) и
+# WireGuard узнавали о новых юзерах только при ребуте сервера (инцидент 2026-11-02).
+# PATCH делается только по реальному диффу полей → лишних apply_users не бывает.
+# После батча — реконсиляция: rendered-конфиги движков сверяются с is_active из БД; при
+# расхождении запускается один `install.sh apply_users` (самовосстановление каждый цикл).
 # ============================================================================
+
+HM_DIR = '/opt/hiddify-manager'
+APPLY_LOCK_FILE = f'{HM_DIR}/log/0-install.lock'   # set_lock() в common/utils.sh; устаревает через 120 с
+APPLY_LOCK_STALE_SEC = 120
+APPLY_WAIT_SEC = 240            # сколько ждём завершения apply_users, запущенного панелью
+APPLY_TIMEOUT_SEC = 300
+APPLY_LOG_FILE = f'{HM_DIR}/log/system/sync-apply-users.log'
+WG_IFACE = 'hiddifywg'
+DRY_RUN = '--dry-run' in sys.argv  # только показать планируемые операции, ничего не менять
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+_NO_PROXY = {'http': None, 'https': None}   # локальный API — всегда напрямую, мимо любых прокси
+
+
+def _child_api(method, path, json_body=None, timeout=30):
+    """Запрос к локальному admin-API child (127.0.0.1:9000)."""
+    return requests.request(
+        method, f"{CHILD_URL}/api/v2/admin/{path}",
+        headers={'Hiddify-API-Key': API_KEY}, json=json_body,
+        timeout=timeout, proxies=_NO_PROXY, verify=False)
+
+
+def fetch_child_users():
+    """Все локальные юзеры через API (та же схема полей, что у parent) → dict по uuid; None при ошибке."""
+    try:
+        r = _child_api('GET', 'user/', timeout=60)
+        if r.status_code == 404:          # «You have no user»
+            return {}
+        if r.status_code != 200:
+            log(f"❌ Локальный API: список юзеров HTTP {r.status_code}")
+            return None
+        return {u['uuid']: u for u in r.json()}
+    except Exception as e:
+        log(f"❌ Локальный API недоступен: {e}")
+        return None
+
+
+def _norm_date(v):
+    return str(v)[:10] if v else None
+
+
+def _desired_fields(parent_user):
+    """Поля, которые child должен иметь (из ответа parent). enable child = is_active parent
+    (учитывает блокировку, исчерпание трафика и истечение срока — рвёт доступ на child)."""
+    is_active = bool(parent_user.get('is_active', parent_user.get('enable')))
+    d = {
+        'name': parent_user.get('name') or '',
+        'usage_limit_GB': float(parent_user.get('usage_limit_GB') or 0),
+        'package_days': int(parent_user.get('package_days') or 0),
+        'mode': parent_user.get('mode') or 'no_reset',
+        'enable': is_active,
+        'comment': parent_user.get('comment') or '',
+        'telegram_id': parent_user.get('telegram_id') or None,
+        'start_date': _norm_date(parent_user.get('start_date')),
+    }
+    # Ключи: слать только непустые ('' затёрло бы сгенерированные панелью ключи).
+    for k in ('ed25519_private_key', 'ed25519_public_key', 'wg_pk', 'wg_pub', 'wg_psk'):
+        if parent_user.get(k):
+            d[k] = parent_user[k]
+    if parent_user.get('lang'):
+        d['lang'] = parent_user['lang']
+    return d
+
+
+def _changed_fields(desired, child_user):
+    """Только реально отличающиеся поля → тело PATCH (пусто = ничего не делать)."""
+    body = {}
+    for k, v in desired.items():
+        c = child_user.get(k)
+        if k == 'usage_limit_GB':
+            if abs(float(c or 0) - v) > 1e-6:
+                body[k] = v
+        elif k == 'comment':
+            if (c or '') != v:
+                body[k] = v
+        elif k == 'telegram_id':
+            if (c or None) != v:
+                body[k] = v
+        elif k == 'start_date':
+            # Hiddify: start_date=None означает «пакет ещё не начат», панель сама ставит дату
+            # первого подключения. Parent (не видит трафик напрямую) держит None, child — дату;
+            # навязывать None каждый цикл = flip-flop с задачей учёта → лишние apply_users.
+            # Поэтому: реальную дату parent'а синхронизируем всегда; None — только если локально
+            # юзер уже ИСТЁК (is_active=False при enable=True), а на parent активен → перевзвести.
+            c_sd = _norm_date(c)
+            if v is not None:
+                if c_sd != v:
+                    body[k] = v
+            elif c_sd is not None and desired['enable'] and child_user.get('enable') \
+                    and not child_user.get('is_active'):
+                body[k] = None
+        elif k == 'enable':
+            if bool(c) != v:
+                body[k] = v
+        elif k == 'lang':
+            if c and c != v:          # пустой локальный lang = дефолт панели, не трогаем
+                body[k] = v
+        else:
+            if (c if c is not None else '') != v:
+                body[k] = v
+    # User.add_or_update применяет start_date только вместе с package_days, ed25519 — только парой.
+    if 'start_date' in body or 'package_days' in body:
+        body['package_days'] = desired['package_days']
+        body['start_date'] = desired['start_date']
+    if 'ed25519_private_key' in body or 'ed25519_public_key' in body:
+        for k in ('ed25519_private_key', 'ed25519_public_key'):
+            if k in desired:
+                body[k] = desired[k]
+    return body
+
+
+def _api_create_user(uuid, desired):
+    body = {k: v for k, v in desired.items() if v is not None}
+    body.update({'uuid': uuid, 'current_usage_GB': 0})
+    r = _child_api('POST', 'user/', body)
+    if r.status_code == 400 and 'exists' in r.text:     # гонка/рассинхрон списка → обновляем
+        body.pop('current_usage_GB', None)
+        r = _child_api('PATCH', f'user/{uuid}/', body)
+    return r
+
+
+def _sql_fixups(parent_users, created_uuids):
+    """Поля, которые admin-API 12.x игнорирует и которые НЕ влияют на рендер конфигов:
+    last_reset_time (из parent) и max_ips=2 для новых. Пишем только при реальном отличии."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+            cursor.execute("SELECT uuid, last_reset_time, max_ips FROM user")
+            local = {r['uuid']: r for r in cursor.fetchall()}
+            fixed = 0
+            for pu in parent_users:
+                row = local.get(pu['uuid'])
+                if not row:
+                    continue
+                lrt = pu.get('last_reset_time')
+                if lrt and str(row['last_reset_time'] or '')[:10] != str(lrt)[:10]:   # колонка DATE
+                    if not DRY_RUN:
+                        cursor.execute("UPDATE user SET last_reset_time=%s WHERE uuid=%s", (lrt, pu['uuid']))
+                    fixed += 1
+                if pu['uuid'] in created_uuids and row['max_ips'] != 2:
+                    if not DRY_RUN:
+                        cursor.execute("UPDATE user SET max_ips=2 WHERE uuid=%s", (pu['uuid'],))
+            conn.commit()
+            if fixed:
+                log(f"🛠 last_reset_time выровнен у {fixed} юзеров (SQL, без влияния на конфиги)")
+    except Exception as e:
+        log(f"⚠️ SQL fixups: {e}")
+    finally:
+        conn.close()
+
 
 def sync_users_from_parent(parent_users):
     """
-    Полная синхронизация пользователей с parent панели.
-
-    Создаёт новых, обновляет существующих, УДАЛЯЕТ отсутствующих на parent.
-    Состояние child-enable и членство в работающем Xray определяются по parent.is_active
-    (ground-truth: учитывает блокировку, исчерпание трафика и истечение срока):
-      - is_active=True  → enable=1, юзер ДОБАВЛЯЕТСЯ в Xray (activate_new_users_direct.py);
-      - is_active=False → enable=0, юзер УДАЛЯЕТСЯ из Xray (deactivate_users_direct.py),
-        соединение рвётся немедленно, не дожидаясь фоновой реконсиляции Hiddify.
-
-    Args:
-        parent_users: Список пользователей с parent (из fetch_parent_users)
+    Полная синхронизация пользователей с parent панели через локальный admin-API.
+      - нет на child → POST (панель: add_client в Xray + apply_users);
+      - есть, но поля отличаются → PATCH только отличающихся полей;
+      - нет на parent → DELETE (с safeguard от массового удаления при сбое parent);
+      - в конце → реконсиляция rendered-конфигов движков с БД (ensure_engines_applied).
     """
     try:
-        conn = get_db_connection()
-        if not conn:
+        child_users = fetch_child_users()
+        if child_users is None:
             return False
+        parent_uuids = {u['uuid'] for u in parent_users}
 
-        with conn.cursor(pymysql.cursors.DictCursor) as cursor:
-            cursor.execute("SELECT uuid, name, enable FROM user")
-            local_users = cursor.fetchall()
-            local_uuids = {u['uuid'] for u in local_users}
-            parent_uuids = {u['uuid'] for u in parent_users}
+        created = patched = blocked = unblocked = errors = 0
+        created_uuids = []
+        activate_uuids = []   # созданные-активные + разблокированные → страховочный hot-add в Xray
+        inactive_uuids = []   # все is_active=False → страховочное удаление из Xray (идемпотентно)
 
-            synced_count = 0
-            blocked_count = 0
-            unblocked_count = 0
-            created_count = 0
-            created_uuids = []
-            activate_uuids = []   # созданные-активные + разблокированные (0→1) → добавить в Xray
-            inactive_uuids = []   # все is_active=False на parent → удалить из Xray (идемпотентно)
+        for pu in parent_users:
+            uuid = pu['uuid']
+            desired = _desired_fields(pu)
+            if not desired['enable']:
+                inactive_uuids.append(uuid)
+            cu = child_users.get(uuid)
 
-            for parent_user in parent_users:
-                uuid = parent_user['uuid']
-
-                # is_active = ground-truth parent: enable И не истёк срок И не превышена квота.
-                # Именно он (а НЕ голый enable) определяет, должен ли юзер быть подключаем на child:
-                # при исчерпании трафика/дней parent оставляет enable=1, но is_active=False.
-                is_active = bool(parent_user.get('is_active', parent_user['enable']))
-                desired_enable = 1 if is_active else 0
-                if not is_active:
-                    inactive_uuids.append(uuid)
-
-                cursor.execute("SELECT id, enable FROM user WHERE uuid = %s", (uuid,))
-                existing_user = cursor.fetchone()
-
-                if not existing_user:
-                    # Создаём нового пользователя с пустыми username/password
-                    # (Hiddify использует UUID-авторизацию, НЕ генерируйте password!)
-                    cursor.execute("""
-                        INSERT INTO user (
-                            uuid, name, usage_limit, package_days, mode, enable,
-                            comment, start_date, last_reset_time, current_usage,
-                            telegram_id, ed25519_private_key, ed25519_public_key,
-                            wg_pk, wg_psk, wg_pub, added_by, last_online, max_ips,
-                            username, password
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, NOW(), 2, '', '')
-                    """, (
-                        uuid, parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3),
-                        parent_user['package_days'], parent_user['mode'], desired_enable,
-                        parent_user.get('comment', ''), parent_user.get('start_date'),
-                        parent_user.get('last_reset_time'), parent_user.get('telegram_id'),
-                        parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
-                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''),
-                        parent_user.get('wg_pub', ''), 1
-                    ))
-                    created_count += 1
+            if cu is None:
+                if DRY_RUN:
+                    log(f"[dry-run] ➕ POST {pu['name']}")
+                    created += 1
+                    continue
+                r = _api_create_user(uuid, desired)
+                if r.ok:
+                    created += 1
                     created_uuids.append(uuid)
-                    if is_active:
-                        activate_uuids.append(uuid)   # сразу подключаем в Xray
-                    log(f"➕ Создан новый пользователь: {parent_user['name']}")
+                    if desired['enable']:
+                        activate_uuids.append(uuid)
+                    log(f"➕ Создан новый пользователь: {pu['name']}")
                 else:
-                    # Обновляем все поля кроме current_usage и last_online
-                    cursor.execute("""
-                        UPDATE user SET
-                            name = %s, usage_limit = %s, package_days = %s,
-                            mode = %s, enable = %s, comment = %s, start_date = %s,
-                            last_reset_time = %s, telegram_id = %s,
-                            ed25519_private_key = %s, ed25519_public_key = %s,
-                            wg_pk = %s, wg_psk = %s, wg_pub = %s, added_by = %s
-                        WHERE uuid = %s
-                    """, (
-                        parent_user['name'], int(parent_user['usage_limit_GB'] * 1024**3), parent_user['package_days'],
-                        parent_user['mode'], desired_enable, parent_user.get('comment', ''),
-                        parent_user.get('start_date'), parent_user.get('last_reset_time'),
-                        parent_user.get('telegram_id'),
-                        parent_user.get('ed25519_private_key', ''), parent_user.get('ed25519_public_key', ''),
-                        parent_user.get('wg_pk', ''), parent_user.get('wg_psk', ''),
-                        parent_user.get('wg_pub', ''), 1,
-                        uuid
-                    ))
+                    errors += 1
+                    log(f"❌ Создание {pu['name']}: HTTP {r.status_code} {r.text[:160]}")
+                continue
 
-                    if existing_user['enable'] != desired_enable:
-                        if desired_enable:
-                            unblocked_count += 1
-                            activate_uuids.append(uuid)   # 0→1: вернуть в Xray
-                            log(f"✅ Разблокирован: {parent_user['name']}")
-                        else:
-                            blocked_count += 1
-                            log(f"🚫 Заблокирован: {parent_user['name']}")
-                            # удаление из Xray — ниже, через inactive_uuids (он уже там)
+            body = _changed_fields(desired, cu)
+            if not body:
+                continue
+            if DRY_RUN:
+                log(f"[dry-run] ✏️ PATCH {pu['name']}: {sorted(body)}")
+                patched += 1
+                continue
+            r = _child_api('PATCH', f'user/{uuid}/', body)
+            if r.ok:
+                patched += 1
+                if 'enable' in body:
+                    if body['enable']:
+                        unblocked += 1
+                        activate_uuids.append(uuid)
+                        log(f"✅ Разблокирован: {pu['name']}")
+                    else:
+                        blocked += 1
+                        log(f"🚫 Заблокирован: {pu['name']}")
+                log(f"✏️ Обновлён {pu['name']}: {sorted(body)}")
+            else:
+                errors += 1
+                log(f"❌ Обновление {pu['name']}: HTTP {r.status_code} {r.text[:160]}")
 
-                synced_count += 1
+        # Отсутствующих на parent — УДАЛЯЕМ через admin-API (каскад БД + Xray + apply_users).
+        # SAFEGUARD от mass-delete при сбое fetch_parent_users (пустой/частичный список):
+        # не удаляем, если parent пуст ИЛИ к удалению >25% локальных (>10 шт).
+        missing_uuids = list(set(child_users) - parent_uuids)
+        if not parent_uuids or len(missing_uuids) > max(10, int(len(child_users) * 0.25)):
+            log(f"⚠️ Удаление ПРОПУЩЕНО (safeguard): missing={len(missing_uuids)}, "
+                f"parent={len(parent_uuids)}, local={len(child_users)} — подозрение на сбой fetch")
+            missing_uuids = []
+        deleted = 0
+        if missing_uuids:
+            if DRY_RUN:
+                log(f"[dry-run] 🗑️ DELETE {len(missing_uuids)} юзеров")
+            else:
+                deleted = _delete_missing_users(missing_uuids)
+                if deleted:
+                    log(f"🗑️  Удалено отсутствующих на parent: {deleted}")
 
-            # Отсутствующих на parent — НЕ блокируем (раньше висели как disabled и попадали в
-            # агрегацию подписки), а УДАЛЯЕМ после коммита через admin-API child.
-            # SAFEGUARD: защита от mass-delete при сбое fetch_parent_users (пустой/частичный список):
-            # не удаляем, если parent пуст ИЛИ к удалению >25% локальных (>10 шт).
-            missing_uuids = list(local_uuids - parent_uuids)
-            if not parent_uuids or len(missing_uuids) > max(10, int(len(local_uuids) * 0.25)):
-                log(f"⚠️ Удаление ПРОПУЩЕНО (safeguard): missing={len(missing_uuids)}, "
-                    f"parent={len(parent_uuids)}, local={len(local_uuids)} — подозрение на сбой fetch")
-                missing_uuids = []
+        _sql_fixups(parent_users, created_uuids)
 
-            conn.commit()
-            log(f"✅ Синхронизация: {synced_count} синхр, {created_count} создано, "
-                f"{blocked_count} заблок, {unblocked_count} разблок")
+        log(f"✅ Синхронизация: {len(parent_users)} проверено, {created} создано, {patched} обновлено, "
+            f"{deleted} удалено, {blocked} заблок, {unblocked} разблок, {errors} ошибок"
+            + (" [dry-run]" if DRY_RUN else ""))
 
-        conn.close()
+        if DRY_RUN:
+            return errors == 0
 
-        # Удаление отсутствующих на parent через admin-API child (каскад БД + Xray), ВНЕ транзакции
-        deleted_count = _delete_missing_users(missing_uuids)
-        if deleted_count:
-            log(f"🗑️  Удалено отсутствующих на parent: {deleted_count}")
-
-        # Деактивация в Xray всех неактивных (is_active=False: блокировка/квота/срок).
-        # Идемпотентно и КАЖДЫЙ цикл (самовосстановление) — child немедленно рвёт соединение,
-        # не дожидаясь фоновой реконсиляции Hiddify. Уже отсутствующие в Xray = no-op.
+        # Страховка поверх нативного hot-add панели (идемпотентно: EmailAlreadyExists = no-op).
         _run_xray_helper('/opt/hiddify-manager/deactivate_users_direct.py', inactive_uuids, 'деактивация')
-
-        # Мгновенная активация в Xray новых и разблокированных (is_active=True)
         _run_xray_helper('/opt/hiddify-manager/activate_new_users_direct.py', activate_uuids, 'активация')
 
-        return True
+        # Реконсиляция движков с БД (ждём apply_users панели, при расхождении — свой apply_users).
+        ensure_engines_applied(changed=bool(created or patched or deleted))
+        return errors == 0
 
     except Exception as e:
         log(f"❌ Ошибка синхронизации пользователей: {e}")
@@ -594,12 +722,138 @@ def sync_users_from_parent(parent_users):
 
 
 # ============================================================================
+# РЕКОНСИЛЯЦИЯ ДВИЖКОВ С БД (rendered-конфиги == is_active)
+# ============================================================================
+
+def _wait_apply_lock(max_wait=APPLY_WAIT_SEC):
+    """Ждём, пока завершится apply_users, запущенный панелью (lock-файл install.sh)."""
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        try:
+            st = os.stat(APPLY_LOCK_FILE)
+        except FileNotFoundError:
+            return True
+        try:
+            ts = int(open(APPLY_LOCK_FILE).read().strip() or 0)
+        except Exception:
+            ts = int(st.st_mtime)
+        if time.time() - ts > APPLY_LOCK_STALE_SEC:   # устаревший lock install.sh игнорирует сам
+            return True
+        time.sleep(2)
+    return False
+
+
+def _rendered_uuid_sets():
+    """uuid'ы в rendered-конфигах: Xray (clients[].id) и sing-box (users[]). None = не прочитать."""
+    xray, sb = set(), set()
+    ok_x = ok_s = False
+    try:
+        d = json.load(open(f'{HM_DIR}/xray/configs/05_inbounds_new.json'))
+        for ib in d.get('inbounds', []):
+            for c in ib.get('settings', {}).get('clients', []) or []:
+                v = str(c.get('id', ''))
+                if _UUID_RE.match(v):
+                    xray.add(v.lower())
+        ok_x = True
+    except Exception as e:
+        log(f"⚠️ rendered xray не прочитан: {e}")
+    for p in glob.glob(f'{HM_DIR}/singbox/configs/05_inbounds_*.json'):
+        try:
+            d = json.load(open(p))
+            ibs = d.get('inbounds', d) if isinstance(d, dict) else d
+            for ib in ibs or []:
+                if not isinstance(ib, dict):
+                    continue
+                for u in ib.get('users') or []:
+                    for k in ('uuid', 'password', 'name', 'username'):
+                        v = str(u.get(k, ''))
+                        if _UUID_RE.match(v):
+                            sb.add(v.lower())
+            ok_s = True
+        except Exception:
+            pass
+    return (xray if ok_x else None), (sb if ok_s else None)
+
+
+def _run_apply_users():
+    """Нативный `install.sh apply_users --no-gui --no-log` (рендер из БД + reload sing-box + WG)."""
+    t0 = time.time()
+    try:
+        os.makedirs(os.path.dirname(APPLY_LOG_FILE), exist_ok=True)
+        with open(APPLY_LOG_FILE, 'a') as lf:
+            lf.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} stable_sync → install.sh apply_users =====\n")
+            lf.flush()
+            p = subprocess.run(['/bin/bash', f'{HM_DIR}/install.sh', 'apply_users', '--no-gui', '--no-log'],
+                               cwd=HM_DIR, stdout=lf, stderr=subprocess.STDOUT, timeout=APPLY_TIMEOUT_SEC,
+                               env={**os.environ, 'HIDDIFY_CONFIG_PATH': HM_DIR})
+    except subprocess.TimeoutExpired:
+        log(f"❌ apply_users не завершился за {APPLY_TIMEOUT_SEC} с, см. {APPLY_LOG_FILE}")
+        return 1
+    except Exception as e:
+        log(f"❌ apply_users не запущен: {e}")
+        return 1
+    if p.returncode == 12:
+        log("⚠️ apply_users: параллельный apply панели (lock) — повторим в следующем цикле")
+    elif p.returncode != 0:
+        log(f"❌ apply_users rc={p.returncode}, см. {APPLY_LOG_FILE}")
+    else:
+        log(f"✅ install.sh apply_users выполнен за {time.time() - t0:.1f} с")
+    return p.returncode
+
+
+def _drift(expected, xray_set, sb_set):
+    out = []
+    for name, s in (('xray', xray_set), ('sing-box', sb_set)):
+        if s is None:
+            continue
+        miss, extra = expected - s, s - expected
+        if miss or extra:
+            out.append(f"{name}: нет {len(miss)}, лишних {len(extra)}")
+    return out
+
+
+def ensure_engines_applied(changed):
+    """rendered-конфиги движков должны содержать ровно is_active-юзеров из БД.
+    Расхождение (напр. панельный apply_users ещё не отработал/пропущен по lock, или юзер
+    отключён) → один `install.sh apply_users`. WireGuard-пиры — информативно."""
+    try:
+        if not _wait_apply_lock():
+            log(f"⚠️ apply_users панели не завершился за {APPLY_WAIT_SEC} с — реконсиляция отложена")
+            return
+        child = fetch_child_users()
+        if child is None:
+            return
+        expected = {u.lower() for u, v in child.items() if v.get('is_active')}
+        drift = _drift(expected, *_rendered_uuid_sets())
+        if drift:
+            log(f"🔧 Расхождение rendered↔БД ({'; '.join(drift)}) → install.sh apply_users")
+            if _run_apply_users() == 0:
+                drift = _drift(expected, *_rendered_uuid_sets())
+                log("✅ Движки согласованы с БД после apply_users" if not drift
+                    else f"❌ Расхождение сохраняется: {'; '.join(drift)}")
+        else:
+            log("✅ Движки согласованы с БД (rendered == is_active)"
+                + (", apply_users панели отработал" if changed else ""))
+        try:
+            peers = set(subprocess.check_output(['wg', 'show', WG_IFACE, 'peers'], text=True,
+                                                stderr=subprocess.DEVNULL).split())
+            exp_wg = {child[u]['wg_pub'] for u in child if child[u].get('is_active') and child[u].get('wg_pub')}
+            if peers != exp_wg:
+                log(f"⚠️ WireGuard-пиры: в ядре {len(peers)}, ожидается {len(exp_wg)} "
+                    f"(нет {len(exp_wg - peers)}, лишних {len(peers - exp_wg)})")
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"⚠️ Реконсиляция движков: {e}")
+
+
+# ============================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================================
 
 def main():
     """
-    Главная функция накопительной синхронизации v4.3.
+    Главная функция накопительной синхронизации v4.4.
 
     Последовательность операций:
       1. Получаем список пользователей с parent (один GET-запрос)
@@ -609,7 +863,7 @@ def main():
       5. Синхронизируем last_online (двунаправленно)
       6. Синхронизируем пользователей (parent → child)
     """
-    log("=== ⚙ Starting Stable Accumulative Sync v4.3 ===")
+    log("=== ⚙ Starting Stable Accumulative Sync v4.4 ===" + (" [DRY-RUN]" if DRY_RUN else ""))
 
     try:
         # Шаг 1: Получаем пользователей с parent (один раз для всех шагов)
@@ -618,6 +872,8 @@ def main():
         if parent_users is None:
             log("❌ Невозможно продолжить без данных с parent")
             return False
+        if DRY_RUN:   # только план операций по юзерам; трафик/last_online не трогаем
+            return sync_users_from_parent(parent_users)
 
         # Шаг 2: Собираем локальную статистику
         log("Step 2: Собираем локальную дельта статистику...")
