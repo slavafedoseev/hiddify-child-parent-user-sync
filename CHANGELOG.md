@@ -31,7 +31,7 @@ sing-box-протоколы и WireGuard видели его лишь после
 - `src/hiddify-patch-xtlsapi-trojan.py` + drop-in `hiddify-panel.service.d/xtlsapi-trojan-patch.conf`
   (ExecStartPre): идемпотентный патч xtlsapi — `flow` передаётся только если поле есть в proto;
   переживает обновления панели.
-- Drop-in `hiddify-child-sync.service.d/10-apply-timeout.conf` (`TimeoutStartSec=900`).
+- Drop-in `hiddify-child-sync.service.d/10-apply-timeout.conf` (`TimeoutStartSec=900` — верхний предел для oneshot-юнита, чтобы зависший apply не висел бесконечно).
 - `install.sh` 5.1: ставит и проверяет новые компоненты, права `0640` на `stable_sync.py`
   (в нём API-ключ parent), перезапуск `hiddify-panel` после патча.
 - `docs/RUNBOOK-v4.4.md`: обновление существующей дочерней панели, установка на новую,
@@ -44,6 +44,13 @@ sing-box-протоколы и WireGuard видели его лишь после
   ожидание lock сводят это к одному apply на цикл.
 - Без `--dry-run` первый запуск v4.4 на панели со «старыми» пользователями, которых нет в
   рендере, сразу выполнит `apply_users` (это и есть починка).
+- `--dry-run` показывает только план по пользователям; реконсиляция движков в нём не
+  выполняется (read-only снимок расхождения — в `docs/RUNBOOK-v4.4.md`, п. 2).
+- `apply_users` не перезапускает Xray: trojan у новых пользователей появляется через hot-add,
+  поэтому патч xtlsapi обязателен.
+- v4.3 убирал отключённых/удалённых пользователей только из работающего Xray — в sing-box
+  и WireGuard они оставались до apply/ребута; v4.4 это закрывает (лишние UUID в рендере →
+  `apply_users`).
 
 ## [4.3] - 2026-06-23
 

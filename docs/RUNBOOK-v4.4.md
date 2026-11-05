@@ -44,8 +44,18 @@ systemctl daemon-reload
 ## 2. Проверка перед боевым запуском
 
 ```bash
-# план операций без изменений (трафик/last_online не трогаются)
+# план операций по пользователям без изменений (трафик/last_online не трогаются).
+# ВАЖНО: реконсиляция движков в dry-run НЕ выполняется и расхождение не показывается.
 /opt/hiddify-manager/.venv313/bin/python /opt/hiddify-manager/stable_sync.py --dry-run | tail -40
+
+# read-only снимок расхождения «БД ↔ рендер» (то, что боевой запуск будет чинить через apply_users):
+cd /opt/hiddify-manager
+mysql -N hiddifypanel -e "select uuid from user where enable=1" | sort > /tmp/db-enabled.txt
+grep -ohE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' singbox/configs/05_inbounds_*.json | sort -u > /tmp/sb-rendered.txt
+grep -ohE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' xray/configs/05_inbounds_new.json | sort -u > /tmp/xray-rendered.txt
+echo "в БД, но нет в sing-box: $(comm -23 /tmp/db-enabled.txt /tmp/sb-rendered.txt | wc -l); лишних в sing-box: $(comm -13 /tmp/db-enabled.txt /tmp/sb-rendered.txt | wc -l)"
+echo "в БД, но нет в xray:     $(comm -23 /tmp/db-enabled.txt /tmp/xray-rendered.txt | wc -l)"
+rm -f /tmp/db-enabled.txt /tmp/sb-rendered.txt /tmp/xray-rendered.txt
 
 # патч xtlsapi на месте
 grep -c PATCHED-trojan-noflow /opt/hiddify-manager/.venv313/lib/python3.13/site-packages/xtlsapi/api_services/handler/add_client.py   # 1
@@ -54,6 +64,21 @@ grep -c PATCHED-trojan-noflow /opt/hiddify-manager/.venv313/lib/python3.13/site-
 systemctl cat hiddify-child-sync.service | grep -A1 TimeoutStartSec
 systemctl cat hiddify-panel.service | grep xtlsapi
 ```
+
+### 2.1 Что должно быть на панели (иначе v4.4 не заработает)
+
+- Локальный admin-API child-панели отвечает на `http://127.0.0.1:9000/<admin_path>/api/v2/admin/user/`
+  с тем же `Hiddify-API-Key`, что у parent (`CHILD_URL` выводится из `PARENT_URL`: admin_path child и
+  parent должны совпадать). `404` на этот запрос = пустой список пользователей, это нормально.
+- Lock-файл `install.sh` — `/opt/hiddify-manager/log/0-install.lock` (так его пишет `set_lock()` в
+  `common/utils.sh` 12.3.x); если он в другом месте, ожидание чужого apply работать не будет.
+- `install.sh apply_users` на панели перерендеривает xray/sing-box/WireGuard из БД и делает reload
+  sing-box + пересборку `hiddifywg`; Xray он НЕ перезапускает — поэтому trojan у нового пользователя
+  появляется только через hot-add (патч xtlsapi обязателен). Если на панели есть собственные
+  патчи отрендеренных конфигов (не в `.j2`), убедитесь, что они переприменяются после apply
+  (на ru01 это `zz-gost-reload.conf`; на ru2 патчи в `.j2` через `ru02-patches.sh`).
+- `TimeoutStartSec=900` для oneshot-юнита — это верхний предел (по умолчанию у oneshot таймаута
+  старта нет), а не «продление»; apply обычно укладывается в 10–60 с.
 
 ## 3. Первый запуск и контроль
 
@@ -70,9 +95,25 @@ wg show hiddifywg allowed-ips | grep -c "10.90.0.$((ID+1))"   # ID — id пол
 systemctl is-active hiddify-xray hiddify-singbox wg-quick@hiddifywg
 ```
 
+Критерий приёмки: со второго цикла таймера в журнале `0 создано, 0 обновлено` и нет строки
+«Расхождение» — иначе parent и child расходятся по какому-то полю, и PATCH + apply_users будут
+повторяться каждые 5 минут (каждый раз SIGHUP sing-box и пересборка WireGuard).
+
+Что реконсиляция НЕ проверяет: живое состояние Xray (только файл на диске), отдельные inbound-ы
+sing-box (сверяется объединение), Mieru и пиры WireGuard (последние только в лог).
+
 Проверка с тест-клиента (ожидаются живые узлы всех протоколов для нового пользователя):
 `python3 ~/sbtest/splitcheck.py singbox <полный sing-box-конфиг пользователя>` и
 `python3 ~/sbtest/run_ru_test.py <конфиг> <label> '<France|England>'`.
+
+### 3.1 Немедленно оживить уже созданного пользователя (без ожидания цикла)
+
+```bash
+U=<uuid>
+/usr/bin/python3 /usr/local/bin/hiddify-patch-xtlsapi-trojan.py          # патч xtlsapi (идемпотентно)
+/opt/hiddify-manager/activate_new_users_direct.py "$U"                      # hot-add в Xray, включая trojan
+/opt/hiddify-manager/install.sh apply_users --no-gui --no-log             # sing-box, WireGuard, Mieru + рендер xray
+```
 
 ## 4. Установка на новую дочернюю панель
 
