@@ -1,0 +1,22 @@
+[Unit]
+Description=Hiddify Child Panel Synchronization (Hiddify 14, v4.5-h14)
+Documentation=https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+After=network-online.target hiddify-mysql.service hiddify-panel.service
+Wants=network-online.target
+# v14: current.json живёт в data/ (в v12 был /opt/hiddify-manager/current.json)
+ConditionPathExists=/opt/hiddify-manager/data/current.json
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hiddify-custom/tools
+Environment=HIDDIFY_CONFIG_PATH=/opt/hiddify-manager/
+ExecStart=/opt/hiddify-manager/.venv313/bin/python /opt/hiddify-custom/tools/stable_sync.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiddify-child-sync
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

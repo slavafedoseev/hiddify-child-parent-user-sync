@@ -7,6 +7,36 @@
 
 ---
 
+## [4.5-h14] - 2026-11-06
+
+Вариант синка для child-панели на **Hiddify Manager 14** (`src/v14/`, проверен на 14.1.0b4).
+Вариант для Hiddify 12 (`src/`) не меняется.
+
+### 🐛 Исправлено
+- На Hiddify 14 синк не создавал пользователей: INSERT в `user` падал с
+  `1364 Field 'deleted' doesn't have a default value` (NOT NULL-колонки `deleted`,
+  `last_modified_time` без default, `STRICT_TRANS_TABLES`), шаг 6 откатывался целиком.
+- Синк выходил с кодом 0 при упавшем шаге — `Result=success` и health `healthy` скрывали поломку.
+
+### ✨ Добавлено
+- Пользователи parent → child только через локальный admin-API 14: POST — только активных на
+  parent (POST в 14 добавляет в движки без проверки активности), PATCH — только отличающихся полей
+  движков и активности, DELETE — после двух прогонов подряд и не больше max(3, 5%) за прогон.
+- Имя, комментарий, telegram_id, язык, `last_reset_time` — SQL-ом с `last_modified_time=NOW()`,
+  без перезагрузки движков.
+- Трафик: локально вычитаются ровно отправленные байты; 404 на parent — дельта отбрасывается.
+- `status.json` в `/var/lib/hiddify-child-sync/`, код выхода 1 при ошибке шага, health
+  `healthy/degraded/unhealthy` (503), блокировка `flock`, бюджет времени, `--dry-run`,
+  `--allow-mass`, `SYNC_SKIP_USERS=1`, `SYNC_ANON=1`.
+- Предохранители: массовое выключение — через прогон; не больше 40 записей через API за прогон;
+  не прижившееся поле не PATCH-ится каждые 5 минут (ошибка, повтор раз в 6 ч).
+- Журнал и статус без URL/ключа parent, admin path и UUID.
+- `src/v14/check_engines.py` — сверка активных пользователей панели с xray (gRPC API),
+  hiddify-core и telemt.
+- `deploy/v14/` — обновление с v4.3/v4.4 в три этапа с бэкапом и откатом;
+  `systemd/v14/` — юниты для `/opt/hiddify-custom/tools` и drop-in `TimeoutStartSec=900`;
+  `tests/v14/` — 56 тестов на модели API 14; `docs/RUNBOOK-v4.5-h14.md`.
+
 ## [4.4.1] - 2026-11-05
 
 ### 🐛 Исправлено
