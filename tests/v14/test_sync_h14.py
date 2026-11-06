@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Тесты stable_sync.py v4.5-h14 и sync_health_api.py без сервера.
+"""Тесты stable_sync.py v4.5.x-h14, sync_health_api.py и check_engines.py без сервера.
 
 requests/pymysql/urllib3 — заглушки. Локальный admin-API и БД child — общее хранилище STORE,
 поведение API повторяет Hiddify 14.1.0b4 (upsert применяет name/comment/telegram_id только
@@ -7,7 +7,8 @@ requests/pymysql/urllib3 — заглушки. Локальный admin-API и �
 GET отдаёт только неудалённых видимых). Поэтому тесты ловят и «вечный PATCH» (второй прогон должен
 давать 0 записей).
 
-usage: python3 tests/v14/test_sync_h14.py [каталог со stable_sync.py и sync_health_api.py; по умолчанию src/v14]
+usage: python3 tests/v14/test_sync_h14.py [каталог со stable_sync.py, sync_health_api.py, check_engines.py;
+       по умолчанию src/v14]
 """
 import importlib.util
 import io
@@ -193,8 +194,10 @@ class Parent:
         self.fail_patch = set()
         self.list_resp = None
         self.patches = []
+        self.verify_seen = set()
 
     def get(self, url, headers=None, verify=None, timeout=None):
+        self.verify_seen.add(verify)
         tail = url.rsplit('/api/v2/admin/', 1)[1]
         if tail == 'user/':
             return self.list_resp or Resp(200, list(self.users.values()))
@@ -205,6 +208,7 @@ class Parent:
         return Resp(200, u) if u else Resp(404, None, 'not found')
 
     def patch(self, url, headers=None, json=None, verify=None, timeout=None):
+        self.verify_seen.add(verify)
         uuid = url.rsplit('/api/v2/admin/', 1)[1].split('/')[1]
         self.patches.append((uuid, json))
         if uuid in self.fail_patch or uuid not in self.users:
@@ -294,7 +298,8 @@ def child(n, **kw):
 
 
 STATE_KEYS = ('STATUS_DIR', 'STATUS_FILE', 'PENDING_DELETE_FILE', 'PENDING_BLOCK_FILE', 'LAST_PATCH_FILE',
-              'LOCK_FILE', 'DRY_RUN', 'ALLOW_MASS', 'SKIP_USERS', 'PARENT_URL', 'API_KEY', 'CHILD_URL')
+              'LOCK_FILE', 'DRY_RUN', 'ALLOW_MASS', 'ALLOW_MASS_DELETE', 'SKIP_USERS', 'PARENT_URL', 'API_KEY',
+              'CHILD_URL')
 
 
 def jload(path):
@@ -313,6 +318,8 @@ def age(path, seconds):
     for k, v in d.items():
         if isinstance(v, int):
             d[k] = v - seconds
+        elif isinstance(v, list):
+            d[k] = [x - seconds for x in v]
         else:
             for f in v.values():
                 f[1] -= seconds
@@ -333,7 +340,7 @@ class Base(unittest.TestCase):
         ss.PENDING_BLOCK_FILE = os.path.join(self.tmp, 'pending_block.json')
         ss.LAST_PATCH_FILE = os.path.join(self.tmp, 'last_patch.json')
         ss.LOCK_FILE = os.path.join(self.tmp, 'sync.lock')
-        ss.DRY_RUN = ss.ALLOW_MASS = ss.SKIP_USERS = False
+        ss.DRY_RUN = ss.ALLOW_MASS = ss.ALLOW_MASS_DELETE = ss.SKIP_USERS = False
         ss.PARENT_URL = 'https://parent.example.net/SeCrEtPaTh'
         ss.API_KEY = 'aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb'
         ss.CHILD_URL = 'http://127.0.0.1:9000/SeCrEtPaTh'
@@ -574,27 +581,87 @@ class Step6(Base):
         STORE.ignore.add('mode')
         par = [pu(1, mode='monthly'), pu(2, mode='monthly', package_days=60)]
         ok, _ = self.step6(par)
-        self.assertTrue(ok)
+        self.assertFalse(ok)                                               # ответ PATCH: mode не применён
         self.assertEqual(len(self.writes()), 2)
+        self.assertEqual(ss.RESULT['stuck'], 2)
+        self.assertIn('mode×2', ss.RESULT['last_error'])
+        self.assertEqual(STORE.users[UU(2)]['package_days'], 60)          # остальное применилось
         ok, _ = self.step6(par)                                            # тот же PATCH снова — не шлём
         self.assertFalse(ok)
         self.assertEqual(self.writes(), [])
         self.assertEqual(ss.RESULT['stuck'], 2)
-        self.assertIn('mode×2', ss.RESULT['last_error'])
-        ok, _ = self.step6(par)                                            # и дальше не шлём
+        ok, _ = self.step6(par)
         self.assertEqual(self.writes(), [])
         age(ss.LAST_PATCH_FILE, ss.STUCK_RETRY_S + 1)
-        ok, _ = self.step6(par)                                            # раз в STUCK_RETRY_S — повтор
+        ok, _ = self.step6(par)                                            # раз в STUCK_RETRY_S — повтор,
         self.assertEqual(len(self.writes()), 2)
+        self.assertFalse(ok)                                               # и он снова ошибка: health не «выздоравливает»
         STORE.ignore.clear()
-        ok, _ = self.step6(par)                                            # починили API — сходится
+        ok, _ = self.step6(par)                                            # починили API — до повтора не шлём
         self.assertEqual(self.writes(), [])
         age(ss.LAST_PATCH_FILE, ss.STUCK_RETRY_S + 1)
         ok, _ = self.step6(par)
+        self.assertTrue(ok)
         self.assertEqual(len(self.writes()), 2)
         ok, _ = self.step6(par)
         self.assertTrue(ok)
         self.assertEqual(self.writes(), [])
+
+    def test_last_patch_has_no_raw_values(self):
+        child(1, wg_pk='old')
+        self.step6([pu(1, wg_pk='PRIVATE-KEY-VALUE-123')])
+        self.assertEqual(self.writes()[0][2], {'wg_pk': 'PRIVATE-KEY-VALUE-123'})
+        with open(ss.LAST_PATCH_FILE, encoding='utf-8') as f:
+            self.assertNotIn('PRIVATE-KEY-VALUE-123', f.read())
+
+    def test_confirmed_blocks_failed_keep_marks(self):
+        for i in range(1, 31):
+            child(i)
+        par = [pu(i, is_active=False) for i in range(1, 31)]
+        self.step6(par)                                                    # 30 > max(5, 3): отложены
+        self.assertEqual(self.writes(), [])
+        age(ss.PENDING_BLOCK_FILE, 300)
+        for i in range(1, 11):
+            STORE.fail[('PATCH', 'user/%s/' % UU(i))] = Resp(502, None, 'busy')
+        ok, _ = self.step6(par)
+        self.assertFalse(ok)
+        self.assertEqual(ss.RESULT['blocked'], 20)
+        self.assertEqual(len(jload(ss.PENDING_BLOCK_FILE)), 10)            # отметки не прошедших сохранены
+        STORE.fail.clear()
+        age(ss.PENDING_BLOCK_FILE, 300)
+        ok, _ = self.step6(par)                                            # 10 > 5, но уже подтверждены
+        self.assertTrue(ok)
+        self.assertEqual([c[2] for c in self.writes()], [{'enable': False}] * 10)
+        self.assertEqual(ss.RESULT['held_blocks'], 0)
+        self.assertEqual(jload(ss.PENDING_BLOCK_FILE), {})
+
+    def test_cap_cut_blocks_not_held_again(self):
+        ss.MAX_WRITES = 10
+        try:
+            for i in range(1, 31):
+                child(i)
+            par = [pu(i, is_active=False) for i in range(1, 31)]
+            self.step6(par)
+            age(ss.PENDING_BLOCK_FILE, 300)
+            self.step6(par)
+            self.assertEqual(len(self.writes()), 10)
+            self.assertEqual(ss.RESULT['backlog'], 20)
+            age(ss.PENDING_BLOCK_FILE, 300)
+            self.step6(par)
+            self.assertEqual(len(self.writes()), 10)                       # не отложены заново
+            self.assertEqual(ss.RESULT['held_blocks'], 0)
+        finally:
+            ss.MAX_WRITES = 40
+
+    def test_block_marks_stale_after_gap(self):
+        for i in range(1, 21):
+            child(i)
+        par = [pu(i, is_active=False) for i in range(1, 21)]
+        self.step6(par)
+        age(ss.PENDING_BLOCK_FILE, ss.SEEN_GAP_S + 60)                     # наблюдений не было 16 минут
+        self.step6(par)
+        self.assertEqual(self.writes(), [])                                # отметки начаты заново
+        self.assertEqual(ss.RESULT['held_blocks'], 20)
 
     def test_changed_value_not_stuck(self):
         child(1)
@@ -630,6 +697,122 @@ class Step6(Base):
         self.assertEqual([c[0] for c in self.writes()], ['POST'])
         self.assertFalse(STORE.users[UU(5)]['deleted'])
 
+    def test_mass_delete_releases_after_hour(self):
+        for i in range(1, 21):
+            child(i)
+        par = [pu(i) for i in range(7, 21)]                                # нет 6 из 20 > max(3, 1)
+        ok, out = self.step6(par)
+        self.assertTrue(ok)                                                # не ошибка, а отложено
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(ss.RESULT['held_deletes'], 6)
+        self.assertNotIn('удалю, если не появится', out)
+        age(ss.PENDING_DELETE_FILE, 300)
+        ok, _ = self.step6(par)
+        self.assertEqual(self.writes(), [])                                # подтверждено, но час не прошёл
+        runs = 0
+        while not self.writes():                                           # наблюдения каждые 5 минут
+            age(ss.PENDING_DELETE_FILE, 300)
+            self.step6(par)
+            runs += 1
+            self.assertLess(runs, 20)
+        first_age = 300 + 300 * runs                                       # возраст отметок к этому прогону
+        self.assertTrue(first_age >= ss.MASS_DELETE_RELEASE_S > first_age - 300, first_age)
+        self.assertEqual([c[0] for c in self.writes()], ['DELETE'] * 3)    # по limit=3 за прогон
+        self.assertEqual(ss.RESULT['held_deletes'], 3)
+        age(ss.PENDING_DELETE_FILE, 300)
+        self.step6(par)
+        self.assertEqual(len(self.writes()), 3)                            # остаток 3 <= limit
+        age(ss.PENDING_DELETE_FILE, 300)
+        ok, _ = self.step6(par)
+        self.assertTrue(ok)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(sum(1 for i in range(1, 7) if STORE.users[UU(i)]['deleted']), 6)
+
+    def test_allow_mass_deletes_in_one_run(self):
+        for i in range(1, 21):
+            child(i)
+        par = [pu(i) for i in range(7, 21)]
+        ok, _ = self.step6(par)
+        self.assertEqual(self.writes(), [])
+        age(ss.PENDING_DELETE_FILE, 300)
+        ss.ALLOW_MASS = True
+        ok, _ = self.step6(par)                                            # сразу, без второго запуска
+        self.assertTrue(ok)
+        self.assertEqual([c[0] for c in self.writes()], ['DELETE'] * 6)
+
+    def test_allow_mass_needs_previous_observation(self):
+        for i in range(1, 21):
+            child(i)
+        ss.ALLOW_MASS = True
+        ok, out = self.step6([pu(i) for i in range(7, 21)])               # отсутствие видно впервые
+        self.assertEqual(self.writes(), [])
+        self.assertIn('меньше 4 мин', out)
+        age(ss.PENDING_DELETE_FILE, 60)
+        ok, _ = self.step6([pu(i) for i in range(7, 21)])                  # повтор через минуту — рано
+        self.assertEqual(self.writes(), [])
+        age(ss.PENDING_DELETE_FILE, 240)
+        ok, _ = self.step6([pu(i) for i in range(8, 21)])                  # 1–6 подтверждены, 7 — впервые
+        self.assertEqual(len(self.writes()), 6)
+        self.assertFalse(STORE.users[UU(7)]['deleted'])
+
+    def test_over_half_needs_allow_mass_delete(self):
+        for i in range(1, 21):
+            child(i)
+        par = [pu(i) for i in range(12, 21)]                               # нет 11 из 20
+        self.step6(par)
+        age(ss.PENDING_DELETE_FILE, 300)
+        ss.ALLOW_MASS = True
+        ok, _ = self.step6(par)
+        self.assertFalse(ok)
+        self.assertEqual(self.writes(), [])
+        self.assertIn('--allow-mass-delete', ss.RESULT['last_error'])
+        age(ss.PENDING_DELETE_FILE, 300)
+        ss.ALLOW_MASS = ss.ALLOW_MASS_DELETE = True
+        ok, _ = self.step6(par)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.writes()), 11)
+
+    def test_allow_mass_does_not_bypass_stuck(self):
+        child(1, mode='no_reset')
+        STORE.ignore.add('mode')
+        self.step6([pu(1, mode='monthly')])
+        ss.ALLOW_MASS = True
+        ok, _ = self.step6([pu(1, mode='monthly')])
+        self.assertFalse(ok)
+        self.assertEqual(self.writes(), [])
+
+    def test_mass_delete_over_half_never_auto(self):
+        for i in range(1, 21):
+            child(i)
+        par = [pu(i) for i in range(12, 21)]                               # нет 11 из 20
+        for _ in range(15):
+            ok, _ = self.step6(par)
+            self.assertFalse(ok)
+            self.assertEqual(self.writes(), [])
+            age(ss.PENDING_DELETE_FILE, 300)
+
+    def test_delete_mark_cleared_when_seen_in_incomplete_list(self):
+        for i in range(1, 6):
+            child(i)
+        self.step6([pu(i) for i in range(1, 5)])                           # 5 нет → отметка
+        age(ss.PENDING_DELETE_FILE, 300)
+        self.step6([pu(i) for i in range(1, 6)], dropped=1)                # 5 вернулся, список с битой записью
+        self.assertEqual(jload(ss.PENDING_DELETE_FILE), {})
+        age(ss.PENDING_DELETE_FILE, 300)
+        self.step6([pu(i) for i in range(1, 5)])                           # снова нет — это первое отсутствие
+        self.assertEqual(self.writes(), [])
+
+    def test_delete_mark_restarts_after_gap(self):
+        for i in range(1, 6):
+            child(i)
+        self.step6([pu(i) for i in range(1, 5)])
+        age(ss.PENDING_DELETE_FILE, ss.SEEN_GAP_S + 60)                    # шаг 6 не шёл 16 минут
+        self.step6([pu(i) for i in range(1, 5)])
+        self.assertEqual(self.writes(), [])
+        age(ss.PENDING_DELETE_FILE, 300)
+        self.step6([pu(i) for i in range(1, 5)])
+        self.assertEqual([c[0] for c in self.writes()], ['DELETE'])
+
     def test_reappeared_user_leaves_pending(self):
         for i in range(1, 6):
             child(i)
@@ -640,9 +823,10 @@ class Step6(Base):
     def test_delete_limit_and_dropped(self):
         for i in range(1, 21):
             child(i)
-        ok, _ = self.step6([pu(i) for i in range(1, 10)])                 # нет 11 из 20 > max(3, 5%)
+        ok, _ = self.step6([pu(i) for i in range(1, 10)])                 # нет 11 из 20: больше половины
         self.assertFalse(ok)
-        self.assertFalse(os.path.exists(ss.PENDING_DELETE_FILE))
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(len(jload(ss.PENDING_DELETE_FILE)), 11)          # отметки ведутся и здесь
         ok, out = self.step6([pu(i) for i in range(1, 20)], dropped=1)
         self.assertIn('Удаление пропущено', out)
         self.assertEqual(self.writes(), [])
@@ -862,6 +1046,68 @@ class MainFlow(Base):
         ok, out = self.main()
         self.assertIn('user2', out)                                       # без SYNC_ANON — с именами
 
+    def test_marks_refreshed_when_step6_fails(self):
+        PARENT.list_resp = Resp(200, [PARENT.users[UU(1)], PARENT.users[UU(2)]])
+        self.main()                                                        # 3 нет на parent → отметка
+        self.assertEqual(len(jload(ss.PENDING_DELETE_FILE)), 1)
+        age(ss.PENDING_DELETE_FILE, 300)
+        PARENT.list_resp = None                                            # 3 вернулся, но child API лёг
+        STORE.fail[('GET', 'user/')] = Resp(502, None, 'Bad Gateway')
+        ok, _ = self.main()
+        self.assertFalse(ok)
+        self.assertEqual(jload(ss.PENDING_DELETE_FILE), {})                # отметка снята по списку parent
+        del STORE.fail[('GET', 'user/')]
+        age(ss.PENDING_DELETE_FILE, 300)
+        PARENT.list_resp = Resp(200, [PARENT.users[UU(1)], PARENT.users[UU(2)]])
+        self.main()                                                        # снова нет — первое отсутствие
+        self.assertNotIn('DELETE', [c[0] for c in self.writes()])
+        self.assertFalse(STORE.users[UU(3)]['deleted'])
+
+    def test_block_marks_refreshed_when_step6_skipped(self):
+        for i in range(4, 21):
+            child(i)
+            PARENT.users[UU(i)] = pu(i)
+        for i in range(1, 21):
+            PARENT.users[UU(i)]['is_active'] = False
+        self.main()                                                        # 20 выключений отложены
+        self.assertEqual(len(jload(ss.PENDING_BLOCK_FILE)), 20)
+        age(ss.PENDING_BLOCK_FILE, 300)
+        for i in range(1, 21):
+            PARENT.users[UU(i)]['is_active'] = True                        # parent одумался,
+        ss.SKIP_USERS = True                                               # но шаг 6 выключен
+        self.main()
+        self.assertEqual(jload(ss.PENDING_BLOCK_FILE), {})
+        ss.SKIP_USERS = False
+        age(ss.PENDING_BLOCK_FILE, 300)
+        for i in range(1, 21):
+            PARENT.users[UU(i)]['is_active'] = False
+        self.main()                                                        # снова массово — снова ждём
+        self.assertEqual([c for c in self.writes() if c[0] == 'PATCH'], [])
+        self.assertTrue(all(STORE.users[UU(i)]['enable'] for i in range(1, 21)))
+
+    def test_marks_extended_by_parent_list_alone(self):
+        PARENT.list_resp = Resp(200, [PARENT.users[UU(1)], PARENT.users[UU(2)]])
+        self.main()
+        age(ss.PENDING_DELETE_FILE, 600)
+        STORE.fail[('GET', 'user/')] = Resp(502, None, 'Bad Gateway')
+        self.main()                                                        # шаг 6 не дошёл, но наблюдение есть
+        del STORE.fail[('GET', 'user/')]
+        age(ss.PENDING_DELETE_FILE, 600)                                   # от первого 1200 с, от последнего 600
+        self.main()
+        self.assertEqual([c[0] for c in self.writes() if c[0] == 'DELETE'], ['DELETE'])
+
+    def test_parent_tls_verified_by_default(self):
+        self.main()
+        self.assertEqual(PARENT.verify_seen, {True})
+        orig = ss.PARENT_TLS_VERIFY
+        ss.PARENT_TLS_VERIFY = '/etc/hiddify-child-sync/parent.pem'
+        try:
+            PARENT.verify_seen.clear()
+            self.main()
+            self.assertEqual(PARENT.verify_seen, {'/etc/hiddify-child-sync/parent.pem'})
+        finally:
+            ss.PARENT_TLS_VERIFY = orig
+
     def test_log_scrubs_secrets(self):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -952,11 +1198,156 @@ class Health(unittest.TestCase):
         self.assertEqual((d['status'], code), ('degraded', 200))
         self.put(held_blocks=20)
         self.assertEqual(self.run_h()[0]['status'], 'degraded')
+        self.put(held_deletes=6)
+        d, code = self.run_h()
+        self.assertEqual((d['status'], code), ('degraded', 200))
+        self.assertTrue(any('удален' in r for r in d['reasons']), d['reasons'])
+
+    def test_server_threaded_with_timeout(self):
+        self.assertTrue(self.h.SyncHealthHandler.timeout and self.h.SyncHealthHandler.timeout <= 30)
+        import inspect
+        self.assertIn('ThreadingHTTPServer', inspect.getsource(self.h.main))
+        for k in ('connect_timeout', 'read_timeout'):
+            self.assertIn(k, self.h.DB_CONFIG)
 
     def test_timer_inactive(self):
         self.put()
         self.obj.get_sync_service_status = lambda: {'active': False, 'enabled': True}
         self.assertEqual(self.run_h()[1], 503)
+
+
+
+# ---------------------------------------------------------------- check_engines
+class Engines(unittest.TestCase):
+    def setUp(self):
+        self.ce = load('check_engines', os.path.join(D, 'check_engines.py'))
+        self.gen = tempfile.mkdtemp()
+        self.ce.GEN = self.gen
+        xb = os.path.join(self.gen, 'xray')
+        with open(xb, 'w') as f:
+            f.write('#!/bin/sh\n')
+        os.chmod(xb, 0o755)
+        self.ce.XRAY_BINS = (xb,)
+        self.ce.time.sleep = lambda s: None
+        self.u = [UU(i) for i in (1, 2, 3)]                               # 1, 2 активны, 3 — нет
+        self.users = {self.u[0]: {'is_active': True}, self.u[1]: {'is_active': True}, self.u[2]: {'is_active': False}}
+        self.ce.load_panel = lambda: dict(self.users)
+        self.xray_emails = [self.u[0], self.u[1]]
+        self.core_state = 'active'
+        self.telemt = [{'username': u.replace('-', ''), 'enabled': True, 'in_runtime': True} for u in self.u[:2]]
+        self.telemt_fail = False
+        self.calls = 0
+        for name, data in (('xray.json', {'inbounds': [{'tag': 't1', 'settings': {'clients': []}},
+                                                       {'tag': 'api', 'settings': {}}]}),
+                           ('hiddify-core.json', {'inbounds': [{'tag': 'c1', 'users': [{'name': self.u[0], 'password': 'x'},
+                                                                                       {'uuid': self.u[1]}]}]})):
+            with open(os.path.join(self.gen, name), 'w') as f:
+                json.dump(data, f)
+        open(os.path.join(self.gen, 'telemt.toml'), 'w').close()
+
+        def run(cmd, **k):
+            self.calls += 1
+            if cmd[1:3] == ['api', 'inbounduser']:
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps({'users': [{'email': e} for e in self.xray_emails]}), stderr='')
+            if cmd[:2] == ['systemctl', 'is-active']:
+                return types.SimpleNamespace(returncode=0, stdout=self.core_state + '\n', stderr='')
+            raise AssertionError(cmd)
+        self.ce.subprocess.run = run
+
+        test = self
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(url, timeout=None):
+            if test.telemt_fail:
+                raise OSError('connection refused')
+            return Resp(json.dumps({'ok': True, 'data': test.telemt}).encode())
+        self.ce.urllib.request.urlopen = urlopen
+
+    def main(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = self.ce.main(list(args))
+        return rc, out.getvalue()
+
+    def test_match(self):
+        rc, out = self.main(_anon_ce(self.u[0]))
+        self.assertEqual(rc, 0, out)
+        self.assertIn('движки совпадают', out)
+        self.assertIn('xray 1, core 1, telemt 1', out)
+        for u in self.u:
+            self.assertNotIn(u, out)                                       # только обезличенные id
+
+    def test_mismatch_and_retry(self):
+        self.xray_emails = [self.u[0]]
+        rc, out = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('нет активных 1', out)
+        n = self.calls
+        rc, out = self.main('--retry', '2')
+        self.assertEqual(rc, 1)
+        self.assertIn('попытка 3 из 3', out)
+        self.assertEqual(self.calls - n, 3 * 2)                            # xray + systemctl в каждой попытке
+
+    def test_inactive_user_in_engine_is_extra(self):
+        self.xray_emails = list(self.u)
+        rc, out = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('лишних 1 (неактивных 1)', out)
+
+    def test_wrong_email_format(self):
+        self.xray_emails = [self.u[0], self.u[1] + '@hiddify.com']
+        rc, out = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('чужих id 1', out)
+
+    def test_core_service_down(self):
+        self.core_state = 'failed'
+        rc, out = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('hiddify-core: служба failed', out)
+
+    def test_unchecked_engine_exit_2(self):
+        self.telemt_fail = True
+        rc, out = self.main()
+        self.assertEqual(rc, 2)
+        self.assertIn('telemt: не проверен', out)
+
+    def test_engine_not_used(self):
+        for n in ('xray.json', 'hiddify-core.json', 'telemt.toml'):
+            os.remove(os.path.join(self.gen, n))
+        rc, out = self.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count('не используется'), 3)
+
+    def test_no_xray_binary(self):
+        self.ce.XRAY_BINS = ('/nonexistent/xray',)
+        self.ce.shutil.which = lambda n: None
+        rc, out = self.main()
+        self.assertEqual(rc, 2)
+        self.assertIn('xray: не проверен', out)
+
+    def test_panel_unavailable(self):
+        self.ce.load_panel = lambda: None
+        rc, out = self.main()
+        self.assertEqual(rc, 2)
+
+    def test_ids(self):
+        self.assertEqual(self.ce.core_id({'name': self.u[0], 'password': 'p'}), self.u[0])
+        self.assertEqual(self.ce.core_id({'uuid': self.u[1], 'name': self.u[0]}), self.u[0])
+        self.assertIsNone(self.ce.core_id({'username': 'abc'}))
+        self.assertEqual(self.ce.dashed(self.u[0].replace('-', '')), self.u[0])
+        self.assertEqual(self.ce.dashed('special'), 'special')
+
+
+def _anon_ce(u):
+    import hashlib
+    return 'u:' + hashlib.sha1(u.encode()).hexdigest()[:8]
 
 
 if __name__ == '__main__':

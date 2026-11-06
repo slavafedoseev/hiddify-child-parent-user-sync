@@ -1,7 +1,7 @@
 #!/opt/hiddify-manager/.venv313/bin/python
 # -*- coding: utf-8 -*-
 """
-Hiddify Manager Child-Parent User Synchronization v4.5-h14 (child на Hiddify 14)
+Hiddify Manager Child-Parent User Synchronization v4.5.1-h14 (child на Hiddify 14)
 Синхронизация пользователей и трафика child-панели Hiddify 14 с parent-панелью.
 
 ОСНОВНАЯ ФУНКЦИОНАЛЬНОСТЬ:
@@ -14,16 +14,19 @@ Hiddify Manager Child-Parent User Synchronization v4.5-h14 (child на Hiddify 1
     пользователя рабочим не делает (панель не следит за БД), helper-ы xtlsapi вредны.
   - Поля, не влияющие на движки (имя, комментарий, telegram_id, язык, last_reset_time), —
     SQL-ом без перезагрузок; PATCH — только enable/лимиты/дни/даты/режим/ключи
-  - Предохранители, не останавливающие остальной синк: массовое выключение и удаление — только
-    если parent требует их два прогона подряд (удаление ещё и не больше 5% за прогон); не больше
-    40 записей через API за прогон; не прижившееся поле не PATCH-ится каждые 5 минут; бюджет
-    времени; блокировка от параллельного запуска; --dry-run — только план
+  - Предохранители, не останавливающие остальной синк: выключение (массовое) и удаление — только
+    если parent требует их два прогона подряд; удаление сверх 5% — через час по частям, больше
+    половины — только вручную; не больше 40 записей через API за прогон; не применённое панелью
+    поле не PATCH-ится каждые 5 минут; бюджет времени; блокировка от параллельного запуска;
+    проверка TLS parent; --dry-run — только план
   - Статус последнего прогона для health: /var/lib/hiddify-child-sync/status.json;
     код выхода 1 при любой ошибке шага
 
 ЗАПУСК: через systemd (hiddify-child-sync.service) или вручную:
   /opt/hiddify-manager/.venv313/bin/python stable_sync.py --dry-run      # план, ничего не меняет
   /opt/hiddify-manager/.venv313/bin/python stable_sync.py --allow-mass   # разово снять предохранители
+  --allow-mass-delete — то же и разрешить удалить больше половины локальных (оба — только тех, кого
+  нет на parent два наблюдения подряд не ближе 4 минут)
   SYNC_SKIP_USERS=1 — аварийно выключить шаг 6 (трафик и last_online продолжают синхронизироваться)
 
 ТРЕБОВАНИЯ: child — Hiddify Manager 14.x (standalone), parent — Hiddify 11/12 с admin-API v2.
@@ -46,8 +49,6 @@ import requests
 import pymysql
 import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # ============================================================================
 # КОНФИГУРАЦИЯ
 # Укажите свои значения (install.sh ставит вариант для Hiddify 12; для 14 — docs/RUNBOOK-v4.5-h14.md).
@@ -61,6 +62,11 @@ PARENT_URL = "https://your-parent-panel.example.com/ADMIN_PATH"
 # API ключ для доступа к parent панели
 # Получите в: Admin Panel → Settings → API Keys
 API_KEY = "your-api-key-here"
+
+# Проверка TLS-сертификата parent: True — по доверенным CA (по умолчанию); путь к файлу CA или
+# сертификата — для parent с самоподписанным сертификатом; False — без проверки (не рекомендуется:
+# API-ключ и admin path получит любой, кто перехватит имя parent).
+PARENT_TLS_VERIFY = True
 
 # URL ЛОКАЛЬНОЙ (child) панели: admin proxy-path идентичен parent -> деривируем из PARENT_URL.
 CHILD_URL = "http://127.0.0.1:9000/" + PARENT_URL.rstrip("/").rsplit("/", 1)[-1]
@@ -78,13 +84,17 @@ DB_CONFIG = {
 # Трафик ниже этого порога накапливается локально до следующего цикла.
 MIN_TRAFFIC_THRESHOLD = 1000000
 
+if PARENT_TLS_VERIFY is False:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # ============================================================================
-# ПАРАМЕТРЫ v4.5-h14
+# ПАРАМЕТРЫ v4.5.x-h14
 # ============================================================================
 
-VERSION = '4.5-h14'
+VERSION = '4.5.1-h14'
 DRY_RUN = '--dry-run' in sys.argv            # только план: ничего не меняет (трафик и last_online тоже)
-ALLOW_MASS = '--allow-mass' in sys.argv      # разово снять предохранители массовых изменений
+ALLOW_MASS_DELETE = '--allow-mass-delete' in sys.argv   # разово разрешить удалить больше половины локальных
+ALLOW_MASS = '--allow-mass' in sys.argv or ALLOW_MASS_DELETE   # разово снять предохранители массовых изменений
 SKIP_USERS = os.environ.get('SYNC_SKIP_USERS') == '1'   # аварийный выключатель шага 6
 STATUS_DIR = '/var/lib/hiddify-child-sync'
 STATUS_FILE = f'{STATUS_DIR}/status.json'
@@ -95,6 +105,8 @@ LOCK_FILE = '/run/hiddify-child-sync.lock'
 MAX_WRITES = 40              # не больше записей через API за прогон, остальное — в следующих прогонах
 TIME_BUDGET_S = 600          # после 10 минут новые записи не начинаем (TimeoutStartSec=900 в юните)
 DELETE_CONFIRM_S = 240       # удаление и массовое выключение — только если parent требует их два прогона подряд
+SEEN_GAP_S = 900             # отметка продолжается, только если прошлое наблюдение не старше 15 минут
+MASS_DELETE_RELEASE_S = 3600 # удаление сверх лимита само идёт по частям, если держится час
 STUCK_RETRY_S = 6 * 3600     # не прижившееся через API поле повторяем не чаще раза в 6 часов
 LANGS = {'en', 'fa', 'ru', 'pt', 'zh', 'my'}            # enum user.lang в Hiddify 14
 MODES = {'no_reset', 'monthly', 'weekly', 'daily'}       # enum user.mode
@@ -104,7 +116,7 @@ _UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _URL_RE = re.compile(r'https?://\S+')
 
 RESULT = {'created': 0, 'patched': 0, 'sql_fixed': 0, 'deleted': 0, 'blocked': 0, 'unblocked': 0,
-          'deferred_inactive': 0, 'held_blocks': 0, 'backlog': 0, 'stuck': 0, 'errors': 0,
+          'deferred_inactive': 0, 'held_blocks': 0, 'held_deletes': 0, 'backlog': 0, 'stuck': 0, 'errors': 0,
           'parent_count': None, 'expected_count': None, 'local_count': None, 'last_error': ''}
 
 # ============================================================================
@@ -183,7 +195,7 @@ def fetch_parent_users():
         response = requests.get(
             f"{PARENT_URL}/api/v2/admin/user/",
             headers={'Hiddify-API-Key': API_KEY},
-            verify=False,
+            verify=PARENT_TLS_VERIFY,
             timeout=60
         )
         if response.status_code != 200:
@@ -274,7 +286,7 @@ def get_parent_user_usage(uuid):
         response = requests.get(
             f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
             headers={'Hiddify-API-Key': API_KEY},
-            verify=False,
+            verify=PARENT_TLS_VERIFY,
             timeout=30
         )
         if response.status_code == 200:
@@ -295,7 +307,7 @@ def update_parent_user_usage(uuid, new_usage_gb, name="Unknown"):
             f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
             headers={'Hiddify-API-Key': API_KEY},
             json={"current_usage_GB": new_usage_gb},
-            verify=False,
+            verify=PARENT_TLS_VERIFY,
             timeout=30
         )
         if response.status_code == 200:
@@ -416,7 +428,7 @@ def _push_last_online_to_parent(uuid, local_online, name):
             f"{PARENT_URL}/api/v2/admin/user/{uuid}/",
             headers={'Hiddify-API-Key': API_KEY},
             json={"last_online": local_online.strftime("%Y-%m-%d %H:%M:%S")},
-            verify=False,
+            verify=PARENT_TLS_VERIFY,
             timeout=30
         )
         if response.status_code == 200:
@@ -679,33 +691,103 @@ def _delete_users(to_delete, child_users, deadline):
     return deleted
 
 
-def _plan_deletions(child_users, parent_uuids, dropped):
-    """Кого удалять: отсутствующие на parent ДВА прогона подряд (>= DELETE_CONFIRM_S), не больше
-    max(3, 5%) локальных за прогон (иначе — подозрение на сбой parent, ничего не удаляем)."""
+def _plan_deletions(child_users, parent_uuids, dropped, now):
+    """Кого удалять. Отметки [первое, последнее наблюдение] в pending_delete.json ведутся в каждом прогоне
+    со списком parent: вернувшийся на parent снимается, перерыв наблюдений больше SEEN_GAP_S начинает
+    отметку заново. Удаляем отсутствующих два прогона подряд (>= DELETE_CONFIRM_S). Больше max(3, 5%)
+    локальных разом — массовое удаление: ждёт MASS_DELETE_RELEASE_S и идёт по limit за прогон, старейшие
+    первыми (предупреждение, не ошибка); больше половины локальных — похоже на сбой parent, только вручную.
+    --allow-mass — удалить сейчас всех подтверждённых (нет на parent два наблюдения подряд не ближе
+    DELETE_CONFIRM_S) без часа ожидания и лимита; больше половины — только с --allow-mass-delete."""
     missing = sorted(set(child_users) - parent_uuids)
+    keyed = {_anon(u): u for u in missing}
+    pending = _load_json(PENDING_DELETE_FILE)
     if dropped or not parent_uuids:
+        # Список parent неполный: новых отметок не ставим, вернувшихся снимаем, не удаляем.
+        if not DRY_RUN:
+            _save_json(PENDING_DELETE_FILE, {k: pending[k] for k in keyed if k in pending})
         if missing:
             log(f"⚠️ Удаление пропущено: список parent неполный (missing={len(missing)})")
         return []
-    limit = max(3, len(child_users) * 5 // 100)
-    if len(missing) > limit and not ALLOW_MASS:
-        _note_error(f"❌ Предохранитель удаления: отсутствуют на parent {len(missing)} > {limit} "
-                    f"(local={len(child_users)}) — ничего не удаляю (проверьте parent; разово: --allow-mass)")
-        return []
-    now = int(time.time())
-    pending = _load_json(PENDING_DELETE_FILE)
-    keyed = {_anon(u): u for u in missing}
-    confirmed = [u for k, u in keyed.items() if isinstance(pending.get(k), int) and now - pending[k] >= DELETE_CONFIRM_S]
-    for k, u in keyed.items():
-        if k not in pending:
-            log(f"⏳ Нет на parent, удалю, если не появится к следующему прогону: {_who(child_users[u])}")
+    marks = _marks_update(pending, keyed, now)
     if not DRY_RUN:
-        _save_json(PENDING_DELETE_FILE, {k: (pending[k] if isinstance(pending.get(k), int) else now) for k in keyed})
-    return confirmed
+        _save_json(PENDING_DELETE_FILE, marks)
+    limit = max(3, len(child_users) * 5 // 100)
+    confirmed = sorted((marks[k][0], u) for k, u in keyed.items() if now - marks[k][0] >= DELETE_CONFIRM_S)
+    if len(missing) <= limit and not ALLOW_MASS:
+        for k, u in keyed.items():
+            if marks[k][0] == now:
+                log(f"⏳ Нет на parent, удалю, если не появится к следующему прогону: {_who(child_users[u])}")
+        return [u for ts, u in confirmed]
+    if len(missing) * 2 > len(child_users) and not ALLOW_MASS_DELETE:
+        _note_error(f"❌ Предохранитель удаления: на parent нет {len(missing)} из {len(child_users)} локальных — "
+                    f"похоже на сбой parent, ничего не удаляю (проверьте parent; удалить всё равно: "
+                    f"--allow-mass-delete)")
+        return []
+    if ALLOW_MASS:
+        ready = [u for ts, u in confirmed]          # два наблюдения не ближе DELETE_CONFIRM_S, как у таймера
+        if len(ready) < len(missing):
+            log(f"⏳ {len(missing) - len(ready)} нет на parent меньше {DELETE_CONFIRM_S // 60} мин — их не удаляю "
+                f"(повторите запуск с флагом позже)")
+        return ready
+    take = [u for ts, u in confirmed if now - ts >= MASS_DELETE_RELEASE_S][:limit]
+    RESULT['held_deletes'] = len(missing) - len(take)
+    log(f"⏸ Массовое удаление: на parent нет {len(missing)} > {limit} (local={len(child_users)}) — "
+        + (f"удаляю {len(take)} старейших, остальные в следующих прогонах" if take else
+           f"начну через {MASS_DELETE_RELEASE_S // 60} мин по {limit} за прогон (сразу: --allow-mass)"))
+    return take
+
+
+def _refresh_marks(parent_users, dropped):
+    """Отметки по списку parent в каждом прогоне — даже если шаг 6 до них не дойдёт (сбой локального API,
+    SYNC_SKIP_USERS, исключение): вернувшиеся на parent снимаются с удаления, снова активные — с
+    выключения; по-прежнему отсутствующим (при полном списке) и неактивным свежие отметки продлеваются.
+    Тогда SEEN_GAP_S прощает только настоящее отсутствие наблюдений (сбой parent, остановленный таймер)."""
+    now = int(time.time())
+    seen = {_anon(pu) for pu in parent_users}
+    inactive = set()
+    for pu in parent_users:
+        try:
+            if not _desired_fields(pu)['enable']:
+                inactive.add(_anon(pu))
+        except Exception:
+            pass
+
+    def fresh(p):
+        return (isinstance(p, list) and len(p) == 2 and all(isinstance(x, int) for x in p)
+                and 0 <= now - p[1] <= SEEN_GAP_S)
+
+    dele = _load_json(PENDING_DELETE_FILE)
+    new_dele = {k: ([p[0], now] if fresh(p) and not dropped else p) for k, p in dele.items() if k not in seen}
+    blk = _load_json(PENDING_BLOCK_FILE)
+    new_blk = {k: ([p[0], now] if fresh(p) and k in inactive else p) for k, p in blk.items()
+               if k in inactive or k not in seen}
+    if new_dele != dele:
+        _save_json(PENDING_DELETE_FILE, new_dele)
+    if new_blk != blk:
+        _save_json(PENDING_BLOCK_FILE, new_blk)
 
 
 def _fp(value):
-    return json.dumps(value, sort_keys=True, default=str)
+    """Отпечаток значения поля (sha256, 16 символов): в last_patch.json не хранятся сами значения —
+    среди полей бывают приватные ключи WireGuard и ed25519."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _marks_update(pending, keys, now):
+    """Отметки [первое, последнее наблюдение] для keys: свежая (прошлое наблюдение не старше SEEN_GAP_S)
+    продолжается, устаревшая или новая начинается заново. Ключей не из keys в результате нет."""
+    out = {}
+    for k in keys:
+        p = pending.get(k)
+        if isinstance(p, int):                       # формат v4.5-h14: только первое наблюдение
+            p = [p, p]
+        if (isinstance(p, list) and len(p) == 2 and all(isinstance(x, int) for x in p)
+                and 0 <= now - p[1] <= SEEN_GAP_S):
+            out[k] = [p[0], now]
+        else:
+            out[k] = [now, now]
+    return out
 
 
 def _drop_stuck_fields(patches, now):
@@ -720,60 +802,67 @@ def _drop_stuck_fields(patches, now):
         prev = last.get(a) if isinstance(last.get(a), dict) else {}
         for k in list(body):
             p = prev.get(k)
-            if (not ALLOW_MASS and isinstance(p, list) and len(p) == 2 and p[0] == _fp(body[k])
+            if (isinstance(p, list) and len(p) == 2 and p[0] == _fp(body[k])
                     and isinstance(p[1], int) and now - p[1] < STUCK_RETRY_S):
                 stuck[k] = stuck.get(k, 0) + 1
                 carry.setdefault(a, {})[k] = p
                 del body[k]
     if stuck:
-        RESULT['stuck'] = sum(stuck.values())
+        RESULT['stuck'] += sum(stuck.values())
         _note_error("❌ Не применяются через API (тот же PATCH уже был успешен): "
                     + ", ".join(f"{k}×{n}" for k, n in sorted(stuck.items()))
-                    + f" — формат полей Hiddify разошёлся? Повтор через {STUCK_RETRY_S // 3600} ч или --allow-mass")
+                    + f" — формат полей Hiddify разошёлся? Повтор раз в {STUCK_RETRY_S // 3600} ч "
+                    f"(раньше: удалить {LAST_PATCH_FILE})")
     return carry
 
 
 def _hold_mass_blocks(patches, child_users, now):
-    """Массовое выключение (больше max(5, 10% активных)): каждое применяется, только если parent
-    требует его два прогона подряд (>= DELETE_CONFIRM_S), — разовый сбой parent не выключит всех,
-    а настоящая массовая блокировка пройдёт через прогон. Остальной синк не ждёт.
-    Возвращает число отложенных выключений."""
-    blocks = [(pu, body) for pu, body, cu in patches if body.get('enable') is False]
+    """Массовое выключение (больше max(5, 10% активных)): каждое применяется, только если parent требует
+    его два прогона подряд (>= DELETE_CONFIRM_S без перерыва наблюдений), — разовый сбой parent не
+    выключит всех, а настоящая массовая блокировка пройдёт через прогон. Остальной синк не ждёт.
+    Отметки ведутся для всех запрошенных выключений и снимаются только после успешного PATCH (в цикле
+    записей): выключение, срезанное MAX_WRITES, бюджетом времени или сбоем, повторного ожидания не требует.
+    Возвращает (отметки, число отложенных выключений)."""
+    blocks = {_anon(pu): body for pu, body, cu in patches if body.get('enable') is False}
     active_local = sum(1 for u in child_users.values() if u.get('enable'))
     limit = max(5, active_local // 10)
-    pending = _load_json(PENDING_BLOCK_FILE)
-    held = {}
+    marks = _marks_update(_load_json(PENDING_BLOCK_FILE), blocks, now)
+    held = 0
     if len(blocks) > limit and not ALLOW_MASS:
-        for pu, body in blocks:
-            a = _anon(pu)
-            ts = pending.get(a)
-            if isinstance(ts, int) and now - ts >= DELETE_CONFIRM_S:
-                continue                                  # parent подтвердил — выключаем
-            held[a] = ts if isinstance(ts, int) else now
-            del body['enable']
+        for k, body in blocks.items():
+            if now - marks[k][0] < DELETE_CONFIRM_S:
+                del body['enable']
+                held += 1
         if held:
             log(f"⏸ Массовое выключение: {len(blocks)} > {limit} (активных {active_local}) — "
-                f"{len(held)} выключу, если parent подтвердит в следующем прогоне")
-    if not DRY_RUN:
-        _save_json(PENDING_BLOCK_FILE, held)
-    return len(held)
+                f"{held} выключу, если parent подтвердит в следующем прогоне")
+    return marks, held
 
 
 def _patch_user(pu, body):
+    """PATCH. Возвращает (успех HTTP, поля тела, которые панель так и не применила). Ответ PATCH в 14 —
+    пользователь после upsert, поэтому не применённое видно сразу, без ожидания следующего прогона."""
     try:
         r = _child_api('PATCH', f"user/{pu['uuid']}/", body)
         if not r.ok:
             _note_error(f"❌ Обновление {{who}}: HTTP {r.status_code} {r.text}", pu)
-            return False
+            return False, set()
+        try:
+            resp = r.json()
+            not_applied = (set(body) & set(_changed_fields(_desired_fields(pu), resp))
+                           if isinstance(resp, dict) and resp.get('uuid') else set())
+        except Exception:
+            not_applied = set()
         RESULT['patched'] += 1
-        if 'enable' in body:
+        if 'enable' in body and 'enable' not in not_applied:
             RESULT['unblocked' if body['enable'] else 'blocked'] += 1
         log(f"✏️ Обновлён {_who(pu)}: {sorted(body)}"
-            + ('' if 'enable' not in body else (' — включён' if body['enable'] else ' — выключен')))
-        return True
+            + ('' if 'enable' not in body else (' — включён' if body['enable'] else ' — выключен'))
+            + (f"; не применено панелью: {sorted(not_applied)}" if not_applied else ''))
+        return True, not_applied
     except Exception as e:
         _note_error(f"❌ Обновление {{who}}: {e}", pu)
-        return False
+        return False, set()
 
 
 def _post_user(pu, desired):
@@ -805,8 +894,8 @@ def sync_users_from_parent(parent_users, dropped=0):
       - есть, отличаются поля движков → PATCH только отличающихся полей (сначала выключения);
       - имя/комментарий/telegram/язык/last_reset_time → SQL без перезагрузок;
       - нет на parent два прогона подряд → DELETE (мягкое в 14).
-    Массовое выключение — через прогон, больше MAX_WRITES записей — по частям, не прижившиеся поля
-    не повторяются (ошибка). Каждый пользователь отдельно.
+    Массовое выключение — через прогон, массовое удаление — через час по частям, больше MAX_WRITES
+    записей — по частям, не применённые панелью поля не повторяются (ошибка). Каждый пользователь отдельно.
     Возвращает True, если в шаге 6 не было своих ошибок.
     """
     err0 = RESULT['errors']
@@ -838,7 +927,7 @@ def sync_users_from_parent(parent_users, dropped=0):
 
         now = int(time.time())
         carry = _drop_stuck_fields(patches, now)
-        RESULT['held_blocks'] = _hold_mass_blocks(patches, child_users, now)
+        block_marks, RESULT['held_blocks'] = _hold_mass_blocks(patches, child_users, now)
         # Порядок: выключения, включения, создания, прочие обновления; не больше MAX_WRITES за прогон.
         ops = [(0 if b.get('enable') is False else 1 if b.get('enable') is True else 3, 'PATCH', pu, b)
                for pu, b, cu in patches if b]
@@ -861,6 +950,7 @@ def sync_users_from_parent(parent_users, dropped=0):
                           patched=sum(1 for o in ops if o[1] == 'PATCH'),
                           blocked=sum(1 for o in ops if o[0] == 0), unblocked=sum(1 for o in ops if o[0] == 1))
         else:
+            not_applied = {}
             for i, (prio, kind, pu, body) in enumerate(ops):
                 if time.time() > deadline:
                     RESULT['backlog'] += len(ops) - i
@@ -868,11 +958,25 @@ def sync_users_from_parent(parent_users, dropped=0):
                     break
                 if kind == 'POST':
                     _post_user(pu, body)
-                elif _patch_user(pu, body):
-                    carry.setdefault(_anon(pu), {}).update({k: [_fp(v), now] for k, v in body.items()})
+                    continue
+                ok, failed = _patch_user(pu, body)
+                if not ok:
+                    continue
+                a = _anon(pu)
+                carry.setdefault(a, {}).update({k: [_fp(v), now] for k, v in body.items()})
+                for k in failed:
+                    not_applied[k] = not_applied.get(k, 0) + 1
+                if body.get('enable') is False and 'enable' not in failed:
+                    block_marks.pop(a, None)
+            if not_applied:
+                RESULT['stuck'] += sum(not_applied.values())
+                _note_error("❌ PATCH успешен, но панель не применила: "
+                            + ", ".join(f"{k}×{n}" for k, n in sorted(not_applied.items()))
+                            + f" — формат полей Hiddify разошёлся? Повтор раз в {STUCK_RETRY_S // 3600} ч")
             _save_json(LAST_PATCH_FILE, carry)
+            _save_json(PENDING_BLOCK_FILE, block_marks)
 
-        to_delete = _plan_deletions(child_users, parent_uuids, dropped)
+        to_delete = _plan_deletions(child_users, parent_uuids, dropped, now)
         if to_delete:
             if DRY_RUN:
                 for u in to_delete:
@@ -888,7 +992,8 @@ def sync_users_from_parent(parent_users, dropped=0):
         log(f"✅ Синхронизация: {len(parent_users)} проверено, {RESULT['created']} создано, "
             f"{RESULT['patched']} обновлено, {RESULT['sql_fixed']} выровнено SQL, {RESULT['deleted']} удалено, "
             f"{RESULT['blocked']} выключено, {RESULT['unblocked']} включено, "
-            f"{RESULT['deferred_inactive']} неактивных не создано, {RESULT['held_blocks']} выключений отложено, "
+            f"{RESULT['deferred_inactive']} неактивных не создано, {RESULT['held_blocks']} выключений и "
+            f"{RESULT['held_deletes']} удалений отложено, "
             f"{RESULT['backlog']} изменений перенесено, {errs} ошибок"
             + (" [dry-run]" if DRY_RUN else ""))
         return errs == 0
@@ -975,6 +1080,12 @@ def main():
         if dropped:
             steps['fetch_parent'] = False
         parent_uuids = {pu['uuid'] for pu in parent_users}
+
+        if not DRY_RUN:
+            try:
+                _refresh_marks(parent_users, dropped)
+            except Exception as e:
+                log(f"⚠️ Отметки удалений/выключений не обновлены: {e}")
 
         if DRY_RUN:
             log("Step 6 [dry-run]: план синхронизации пользователей...")

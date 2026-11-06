@@ -21,7 +21,7 @@ curl http://localhost:8081/api/v2/hiddify-sync/health | jq
 import json
 import subprocess
 import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import pymysql
 
@@ -37,10 +37,13 @@ DB_CONFIG = {
     'unix_socket': '/var/run/mysqld/mysqld.sock',
     'user': 'root',
     'database': 'hiddifypanel',
-    'charset': 'utf8mb4'
+    'charset': 'utf8mb4',
+    'connect_timeout': 5,       # зависшая БД не должна вешать health
+    'read_timeout': 10,
+    'write_timeout': 10,
 }
 
-# Статус последнего прогона синка (пишет stable_sync.py v4.5-h14)
+# Статус последнего прогона синка (пишет stable_sync.py v4.5.x-h14)
 STATUS_FILE = '/var/lib/hiddify-child-sync/status.json'
 MAX_AGE_S = 15 * 60     # статус и последний успешный шаг 6 не старше 15 минут (таймер — раз в 5 минут)
 
@@ -50,6 +53,7 @@ MAX_AGE_S = 15 * 60     # статус и последний успешный ш
 
 class SyncHealthHandler(BaseHTTPRequestHandler):
     """HTTP request handler для мониторинга синхронизации"""
+    timeout = 10    # «молчащее» соединение не держит обработчик дольше 10 с (сервер потоковый)
 
     def do_GET(self):
         """Обработка GET запросов"""
@@ -124,6 +128,8 @@ class SyncHealthHandler(BaseHTTPRequestHandler):
                     warn.append(f"синк догоняет: {last_run['backlog']} изменений перенесено на следующие прогоны")
                 if last_run.get("held_blocks"):
                     warn.append(f"массовое выключение: {last_run['held_blocks']} ждут подтверждения parent")
+                if last_run.get("held_deletes"):
+                    warn.append(f"массовое удаление: {last_run['held_deletes']} удалений отложено (идёт по частям)")
             health_data["reasons"] = bad + warn
             health_data["status"] = "unhealthy" if bad else ("degraded" if warn else "healthy")
 
@@ -338,7 +344,8 @@ class SyncHealthHandler(BaseHTTPRequestHandler):
 def main():
     """Запуск HTTP сервера на localhost:8081"""
     server_address = ('127.0.0.1', API_PORT)
-    httpd = HTTPServer(server_address, SyncHealthHandler)
+    httpd = ThreadingHTTPServer(server_address, SyncHealthHandler)
+    httpd.daemon_threads = True
 
     print(f"🔍 Hiddify Sync Health API v2.0 запущен на порту {API_PORT}")
     print(f"📊 Доступные endpoints:")
