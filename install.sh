@@ -23,7 +23,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Версия скрипта
-VERSION="5.0"
+VERSION="5.1"
 
 # GitHub репозиторий
 GITHUB_REPO="slavafedoseev/hiddify-child-parent-user-sync"
@@ -211,6 +211,13 @@ download_files() {
     log_info "Загрузка celery-rollback-patch.conf..."
     curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/celery-rollback-patch.conf" -o "$temp_dir/celery-rollback-patch.conf"
 
+    log_info "Загрузка hiddify-patch-xtlsapi-trojan.py (v4.4: hot-add trojan)..."
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/src/hiddify-patch-xtlsapi-trojan.py" -o "$temp_dir/hiddify-patch-xtlsapi-trojan.py"
+
+    log_info "Загрузка systemd drop-in'ов v4.4..."
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/hiddify-panel.service.d/xtlsapi-trojan-patch.conf" -o "$temp_dir/xtlsapi-trojan-patch.conf"
+    curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused "${RAW_URL}/systemd/hiddify-child-sync.service.d/10-apply-timeout.conf" -o "$temp_dir/10-apply-timeout.conf"
+
     log_success "Все файлы загружены"
 
     echo "$temp_dir"
@@ -242,11 +249,17 @@ install_scripts() {
     cp "$temp_dir/hiddify-patch-celery-rollback.py" /usr/local/bin/
     chmod +x /usr/local/bin/hiddify-patch-celery-rollback.py
 
+    log_info "Копирование hiddify-patch-xtlsapi-trojan.py..."
+    cp "$temp_dir/hiddify-patch-xtlsapi-trojan.py" /usr/local/bin/
+    chmod +x /usr/local/bin/hiddify-patch-xtlsapi-trojan.py
+
     # Устанавливаем права
     chown root:hiddify-common /opt/hiddify-manager/stable_sync.py
     chown root:hiddify-common /opt/hiddify-manager/sync_health_api.py
     chown root:hiddify-common /opt/hiddify-manager/activate_new_users_direct.py
     chown root:hiddify-common /opt/hiddify-manager/deactivate_users_direct.py
+    # stable_sync.py содержит API-ключ parent-панели: не world-readable (сервисы работают от root)
+    chmod 0640 /opt/hiddify-manager/stable_sync.py
 
     log_success "Скрипты установлены"
 }
@@ -278,6 +291,13 @@ install_systemd_services() {
     mkdir -p /etc/systemd/system/hiddify-panel-background-tasks.service.d
     cp "$temp_dir/celery-rollback-patch.conf" /etc/systemd/system/hiddify-panel-background-tasks.service.d/
 
+    # v4.4: патч xtlsapi (hot-add trojan) переприменяется при каждом старте панели,
+    # а синку даётся до 900 с на install.sh apply_users
+    log_info "Установка drop-in'ов v4.4 (xtlsapi-trojan-patch, apply-timeout)..."
+    mkdir -p /etc/systemd/system/hiddify-panel.service.d /etc/systemd/system/hiddify-child-sync.service.d
+    cp "$temp_dir/xtlsapi-trojan-patch.conf" /etc/systemd/system/hiddify-panel.service.d/
+    cp "$temp_dir/10-apply-timeout.conf" /etc/systemd/system/hiddify-child-sync.service.d/
+
     log_info "Перезагрузка systemd daemon..."
     systemctl daemon-reload
 
@@ -285,6 +305,12 @@ install_systemd_services() {
     log_info "Применение Celery stability patch..."
     /usr/bin/python3 /usr/local/bin/hiddify-patch-celery-rollback.py || true
     systemctl restart hiddify-panel-background-tasks.service 2>/dev/null || true
+
+    # Применяем патч xtlsapi сейчас и перезапускаем панель, чтобы её процесс загрузил
+    # исправленный модуль (прокси-движки это не затрагивает, только админку на ~5 с)
+    log_info "Применение xtlsapi trojan patch..."
+    /usr/bin/python3 /usr/local/bin/hiddify-patch-xtlsapi-trojan.py || true
+    systemctl restart hiddify-panel.service 2>/dev/null || true
 
     log_success "Systemd сервисы установлены"
 }
@@ -348,6 +374,23 @@ verify_installation() {
     done
 
     # Проверка сервисов
+    log_info "Проверка компонентов v4.4..."
+    for file in "/usr/local/bin/hiddify-patch-xtlsapi-trojan.py" \
+                "/etc/systemd/system/hiddify-panel.service.d/xtlsapi-trojan-patch.conf" \
+                "/etc/systemd/system/hiddify-child-sync.service.d/10-apply-timeout.conf"; do
+        if [ -f "$file" ]; then
+            log_success "Найден: $file"
+        else
+            log_error "Отсутствует: $file"
+            all_ok=false
+        fi
+    done
+    if grep -qs "PATCHED-trojan-noflow" /opt/hiddify-manager/.venv*/lib/python*/site-packages/xtlsapi/api_services/handler/add_client.py; then
+        log_success "xtlsapi trojan patch применён"
+    else
+        log_warning "xtlsapi trojan patch не найден в site-packages (hot-add trojan будет молча падать)"
+    fi
+
     log_info "Проверка сервисов..."
     if systemctl is-active --quiet hiddify-child-sync.timer; then
         log_success "hiddify-child-sync.timer активен"
@@ -399,6 +442,8 @@ print_usage_info() {
     echo ""
     echo -e "  Ручной запуск синхронизации:"
     echo -e "    ${YELLOW}systemctl start hiddify-child-sync.service${NC}"
+    echo -e "  Показать план без изменений (dry-run):"
+    echo -e "    ${YELLOW}/opt/hiddify-manager/.venv313/bin/python /opt/hiddify-manager/stable_sync.py --dry-run${NC}"
     echo ""
     echo -e "${BLUE}🔍 HTTP API мониторинга:${NC}"
     echo ""
