@@ -1,0 +1,25 @@
+[Unit]
+Description=Hiddify Child Sync Health API (Hiddify 14, 127.0.0.1:8081)
+Documentation=https://github.com/slavafedoseev/hiddify-child-parent-user-sync
+After=network-online.target hiddify-mysql.service hiddify-panel.service
+Wants=network-online.target
+ConditionPathExists=/opt/hiddify-manager/data/current.json
+StartLimitBurst=10
+StartLimitIntervalSec=600
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hiddify-custom/tools
+Environment=HIDDIFY_CONFIG_PATH=/opt/hiddify-manager/
+ExecStart=/opt/hiddify-manager/.venv313/bin/python /opt/hiddify-custom/tools/sync_health_api.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiddify-sync-api
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
