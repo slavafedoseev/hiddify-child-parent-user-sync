@@ -1,21 +1,26 @@
 #!/bin/bash
 # Этап A: сборка stable_sync.py.new с конфигом (PARENT_URL, API_KEY, DB_CONFIG, PARENT_TLS_VERIFY) из
 # ЖИВОГО файла (build_new.py), компиляция, бэкап (файлы + дамп таблицы user), dry-run. В работу ничего не
-# включает и точку отката /root/sync-h14.last не трогает: пишет кандидата /root/sync-h14.next (бэкап
-# того, что заменит этап B, с маркером new.sha256); .last переносит сам этап B при переключении.
-# /root/sync-h14.baseline — версия до первой v4.5 (пишется один раз). Если вся сборка (синк, health,
-# check_engines, rollback.sh) уже в работе — только dry-run. Запуск: sudo bash $SYNC_UPLOAD/deploy-a.sh.
-# Секреты, имена и UUID не печатает.
+# включает и точку отката /root/sync-h14.last не трогает: пишет кандидата /root/sync-h14.next (бэкап того,
+# что заменит этап B, с маркером new.sha256, sha загруженных файлов и копией сборки); .last и .baseline (версия до v4.5)
+# переносит этап B при переключении. Если вся сборка (синк, health, check_engines, rollback.sh) уже в
+# работе — только dry-run, а кандидат прошлого этапа A снимается. Отказ (код 1): идёт другой этап или
+# откат (общая блокировка /root/sync-h14.lock) либо этап B кандидата начал переключение и не закончен
+# (deploy-b.switched без deploy-b.done) — тогда доделать B или откатить.
+# Запуск: sudo bash $SYNC_UPLOAD/deploy-a.sh. Секреты, имена и UUID не печатает.
 set -euo pipefail
 umask 077
 T=${SYNC_TOOLS:-/opt/hiddify-custom/tools}; U=${SYNC_UPLOAD:-/tmp/sync14}; PY=/opt/hiddify-manager/.venv313/bin/python
+{ exec 9>>/root/sync-h14.lock; } 2>/dev/null || { echo "этап A отменён: не открыть /root/sync-h14.lock — запускайте от root (sudo)"; exit 1; }
+flock -n 9 || { echo "этап A отменён: идёт другой этап выкатки или откат (обрыв ssh его не прерывает) — дождитесь окончания"; exit 1; }
 NEWVER=$(sed -n "s/^VERSION = '\(.*-h14\)'$/\1/p" $U/stable_sync.py)
 [ -n "$NEWVER" ] || { echo "в $U/stable_sync.py нет VERSION = '…-h14'"; exit 1; }
 PREVVER=$(sed -n "s/^VERSION = '\(.*\)'$/\1/p" $T/stable_sync.py); PREVVER=${PREVVER:-4.3}
 NX=$(readlink -f "$(cat /root/sync-h14.next 2>/dev/null)" 2>/dev/null || true)
-if [ -n "$NX" ] && [ -f "$NX/new.sha256" ] && [ ! -f "$NX/deploy-b.done" ] \
-   && [ "$(sha256sum < $T/stable_sync.py | cut -c1-64)" = "$(cat "$NX/new.sha256")" ]; then
-  echo "этап B кандидата $NX начат и не закончен — запустите deploy-b.sh, он доделает (этап A отменён)"
+if [ -n "$NX" ] && [ -f "$NX/deploy-b.switched" ] && [ ! -f "$NX/deploy-b.done" ]; then
+  RB="sudo bash $T/rollback.sh"; [[ "$(cat "$NX/prev.version" 2>/dev/null)" == *-h14 ]] || RB="$RB --baseline"
+  echo "этап B кандидата $NX начат и не закончен — запустите deploy-b.sh, он доделает, или откатите: $RB"
+  echo "(откат снимет кандидата); этап A отменён, ничего не изменено"
   exit 1
 fi
 
@@ -47,6 +52,10 @@ same_all() {
 }
 if same_all; then
   rm -f $T/stable_sync.py.new
+  if [ -f /root/sync-h14.next ]; then     # этап B его не начинал (проверено выше), а выкатывать нечего
+    rm -f /root/sync-h14.next $T/sync_health_api.py.new $T/check_engines.py.new $T/rollback.sh.new
+    echo "кандидат прошлого этапа A снят ($NX): загруженная сборка уже в работе"
+  fi
   echo "сборка v$NEWVER уже в работе целиком — бэкап, точки отката и маркер не меняются, этап B не нужен"
   echo "=== DRY-RUN работающей v$NEWVER (обезличенно) ==="
   OUTF=$(mktemp); dryrun $T/stable_sync.py "$OUTF"; rm -f "$OUTF"
@@ -62,12 +71,12 @@ mysqldump --single-transaction hiddifypanel user > "$B/user-table.sql"
 chmod 600 "$B"/*
 echo "бэкап: $B (в работе v$PREVVER; $(ls "$B" | tr '\n' ' '); дамп user: $(wc -c < "$B/user-table.sql") Б)"
 cmp -s $T/stable_sync.py.new $T/stable_sync.py && echo "код синка тот же — этап B обновит health, check_engines и rollback.sh"
-if [ ! -f /root/sync-h14.baseline ]; then          # версия до первой v4.5 — один раз
+if [ ! -f /root/sync-h14.baseline ]; then      # старая раскладка: .last — каталог с .v43, то есть версия до v4.5
   OLD=$(readlink -f "$(cat /root/sync-h14.last 2>/dev/null)" 2>/dev/null || true)
-  if [ -n "$OLD" ] && [ -f "$OLD/stable_sync.py.v43" ]; then echo "$OLD" > /root/sync-h14.baseline
-  elif [[ "$PREVVER" != *-h14 ]]; then echo "$B" > /root/sync-h14.baseline; fi
+  [ -z "$OLD" ] || [ ! -f "$OLD/stable_sync.py.v43" ] || echo "$OLD" > /root/sync-h14.baseline
 fi
-[ ! -f /root/sync-h14.baseline ] || echo "точка отката к версии до v4.5: $(cat /root/sync-h14.baseline)"
+if [ -f /root/sync-h14.baseline ]; then echo "точка отката к версии до v4.5: $(cat /root/sync-h14.baseline)"
+elif [[ "$PREVVER" != *-h14 ]]; then echo "в работе v$PREVVER: точку отката к ней (/root/sync-h14.baseline) запишет этап B при переключении"; fi
 stat -c '%a %U:%G %n' $T/stable_sync.py $T/stable_sync.py.new $T/sync_health_api.py
 
 echo "=== DRY-RUN v$NEWVER (обезличенно) ==="
@@ -75,7 +84,10 @@ dryrun $T/stable_sync.py.new "$B/dryrun-a.txt"
 
 sha256sum < $T/stable_sync.py.new | cut -c1-64 > "$B/new.sha256"
 sha256sum < $U/stable_sync.py | cut -c1-64 > "$B/upload.sha256"      # какую загрузку собирали
+( cd $U && sha256sum sync_health_api.py check_engines.py rollback.sh ) > "$B/upload-aux.sha256"
+cp $T/stable_sync.py.new "$B/stable_sync.py.built"; cp $U/build_new.py "$B/build_new.py"     # для доделки этапа B
+chmod 600 "$B/stable_sync.py.built" "$B/build_new.py"
 L=$(readlink -f "$(cat /root/sync-h14.last 2>/dev/null)" 2>/dev/null || true)
 [ -z "$L" ] || [ ! -d "$L" ] || echo "$L" > "$B/prev-last"          # цепочка точек отката
 echo "$B" > /root/sync-h14.next
-echo "этап A готов: кандидат для этапа B — $B (маркер new.sha256); точка отката /root/sync-h14.last сменится на него только в этапе B"
+echo "этап A готов: кандидат для этапа B — $B (маркер new.sha256); точка отката /root/sync-h14.last сменится только в этапе B"
